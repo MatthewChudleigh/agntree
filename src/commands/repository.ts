@@ -175,8 +175,9 @@ export function registerRepositoryCommands(
             cancellable: false,
           },
           async () => {
-            const { execSync } = require('child_process');
-            execSync(`git clone "${normalizedUrl}" "${clonePath}"`, {
+            // execFile with an argument array — never interpolate the URL/path into a shell string.
+            const { execFileSync } = require('child_process');
+            execFileSync('git', ['clone', normalizedUrl, clonePath], {
               encoding: 'utf-8',
               stdio: ['pipe', 'pipe', 'pipe'],
             });

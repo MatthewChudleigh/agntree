@@ -193,6 +193,24 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
   }
 
   /**
+   * Lazily fill in a chat item's tooltip when it's hovered. Reading the session recap
+   * and message preview happens here (async, streamed) rather than during tree building,
+   * so refreshes stay cheap and never block the extension host.
+   */
+  async resolveTreeItem(
+    item: WorkspaceTreeItem,
+    _element: WorkspaceTreeItem,
+    _token: vscode.CancellationToken
+  ): Promise<WorkspaceTreeItem> {
+    if (item.itemType === 'chat' && !item.tooltip) {
+      const chat = item.data as ChatSession;
+      const isActive = this.terminalManager.isActive(chat.id);
+      item.tooltip = await this.formatChatTooltip(chat, isActive);
+    }
+    return item;
+  }
+
+  /**
    * Get parent of a tree item (required for reveal() to work)
    */
   getParent(element: WorkspaceTreeItem): WorkspaceTreeItem | undefined {
@@ -453,7 +471,8 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
         item.description = 'new session';
       }
 
-      item.tooltip = this.formatChatTooltip(chat, isActive);
+      // Tooltip (recap + preview) is computed lazily in resolveTreeItem on hover,
+      // so building the tree never reads session files.
 
       // Make it clickable to open the chat
       item.command = {
@@ -542,13 +561,13 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
   /**
    * Format chat tooltip with session preview
    */
-  private formatChatTooltip(chat: ChatSession, isActive: boolean): vscode.MarkdownString {
+  private async formatChatTooltip(chat: ChatSession, isActive: boolean): Promise<vscode.MarkdownString> {
     const md = new vscode.MarkdownString();
     md.supportHtml = true;
 
     // Recap at the top if available
     if (chat.claudeSessionId) {
-      const recap = this.claudeSessionService.getSessionRecap(chat.claudeSessionId);
+      const recap = await this.claudeSessionService.getSessionRecap(chat.claudeSessionId);
       if (recap) {
         md.appendMarkdown(`**Recap**\n\n`);
         md.appendMarkdown(`${recap}\n\n`);
@@ -566,7 +585,7 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
 
     // Session preview if available
     if (chat.claudeSessionId) {
-      const preview = this.claudeSessionService.getSessionPreview(chat.claudeSessionId, 3);
+      const preview = await this.claudeSessionService.getSessionPreview(chat.claudeSessionId, 3);
       if (preview.length > 0) {
         md.appendMarkdown(`---\n\n`);
         md.appendMarkdown(`**Recent messages:**\n\n`);

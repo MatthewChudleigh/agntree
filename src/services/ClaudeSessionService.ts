@@ -31,10 +31,80 @@ export class ClaudeSessionService {
   private claudeDir: string;
   private projectsDir: string;
 
+  /** Cache of parsed sessions keyed by file path, invalidated by mtime/size. */
+  private parseCache = new Map<string, { mtimeMs: number; size: number; session: ClaudeSession | null }>();
+
   constructor() {
     const homeDir = process.env.HOME || process.env.USERPROFILE || '';
     this.claudeDir = path.join(homeDir, '.claude');
     this.projectsDir = path.join(this.claudeDir, 'projects');
+  }
+
+  /**
+   * Read a file line-by-line off the event loop. `onLine` may return `true` to stop early.
+   * Streaming (instead of readFileSync + split) avoids allocating whole multi-MB session
+   * logs and, crucially, keeps the VS Code extension host responsive while they are scanned.
+   */
+  private streamLines(filePath: string, onLine: (line: string) => boolean | void): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const stream = fs.createReadStream(filePath, { encoding: 'utf-8' });
+      const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+      let done = false;
+      const finish = (err?: Error) => {
+        if (done) return;
+        done = true;
+        rl.close();
+        stream.destroy();
+        if (err) { reject(err); } else { resolve(); }
+      };
+      rl.on('line', (line) => {
+        if (done) return;
+        try {
+          if (onLine(line) === true) { finish(); }
+        } catch (e) {
+          finish(e as Error);
+        }
+      });
+      rl.on('close', () => finish());
+      stream.on('error', (e) => finish(e));
+    });
+  }
+
+  /**
+   * Locate the session file for a session ID by scanning project directories.
+   * Robust against path-encoding edge cases and forked sessions.
+   */
+  private findSessionFilePath(sessionId: string): string | null {
+    for (const dir of this.getProjectDirs()) {
+      const fp = path.join(dir, `${sessionId}.jsonl`);
+      if (fs.existsSync(fp)) {
+        return fp;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Extract the first text content from a session message entry (string, or content blocks).
+   */
+  private extractUserText(message: unknown): string {
+    if (typeof message === 'string') {
+      return message;
+    }
+    if (message && typeof message === 'object') {
+      const content = (message as { content?: unknown }).content;
+      if (typeof content === 'string') {
+        return content;
+      }
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block && block.type === 'text' && typeof block.text === 'string' && block.text) {
+            return block.text;
+          }
+        }
+      }
+    }
+    return '';
   }
 
   /**
@@ -101,7 +171,9 @@ export class ClaudeSessionService {
   }
 
   /**
-   * Parse a session file to extract metadata
+   * Parse a session file to extract metadata.
+   * Streamed (not readFileSync) so large logs don't block the event loop, and cached
+   * by file mtime/size so repeated scans (search, import, tooltips) stay cheap.
    */
   private async parseSessionFile(filePath: string, sessionId: string): Promise<ClaudeSession | null> {
     let stats: fs.Stats;
@@ -116,6 +188,11 @@ export class ClaudeSessionService {
       return null;
     }
 
+    const cached = this.parseCache.get(filePath);
+    if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+      return cached.session;
+    }
+
     const session: ClaudeSession = {
       sessionId,
       cwd: '',
@@ -127,89 +204,70 @@ export class ClaudeSessionService {
       messageCount: 0,
     };
 
-    // Read file content synchronously (simpler and more reliable)
+    let firstUserPrompt: string | null = null;
+    let latestRecapTimestamp = 0;
+
     try {
-      const content = fs.readFileSync(filePath, 'utf-8');
-      const lines = content.split('\n');
+      await this.streamLines(filePath, (line) => {
+        if (!line.trim()) return;
 
-      let firstUserPrompt: string | null = null;
-      let latestRecapTimestamp = 0;
-
-      for (const line of lines) {
-        if (!line.trim()) continue;
-
+        let entry: Record<string, unknown>;
         try {
-          const entry = JSON.parse(line);
-
-          // Get summary (prefer the last one as it's usually most descriptive)
-          if (entry.type === 'summary' && entry.summary) {
-            session.summary = entry.summary;
-          }
-
-          // Get recap from away_summary entries — keep the most recent by timestamp
-          if (entry.type === 'system' && entry.subtype === 'away_summary' && entry.content) {
-            const ts = entry.timestamp ? new Date(entry.timestamp).getTime() : 0;
-            if (ts >= latestRecapTimestamp) {
-              latestRecapTimestamp = ts;
-              // Strip the trailing "(disable recaps in /config)" hint
-              session.recap = entry.content.replace(/\s*\(disable recaps in \/config\)\s*$/, '').trim();
-            }
-          }
-
-          // Get first user prompt as fallback for summary
-          if (!firstUserPrompt && entry.type === 'user' && entry.message) {
-            let text = '';
-            if (typeof entry.message === 'string') {
-              text = entry.message;
-            } else if (entry.message.content) {
-              if (Array.isArray(entry.message.content)) {
-                for (const block of entry.message.content) {
-                  if (block.type === 'text' && block.text) {
-                    text = block.text;
-                    break;
-                  }
-                }
-              } else if (typeof entry.message.content === 'string') {
-                text = entry.message.content;
-              }
-            }
-            if (text) {
-              firstUserPrompt = text;
-            }
-          }
-
-          // Get cwd and branch from user/assistant messages
-          if (entry.cwd && !session.cwd) {
-            session.cwd = entry.cwd;
-          }
-
-          if (entry.gitBranch && !session.gitBranch) {
-            session.gitBranch = entry.gitBranch;
-          }
-
-          // Count messages
-          if (entry.type === 'user' || entry.type === 'assistant') {
-            session.messageCount++;
-          }
+          entry = JSON.parse(line);
         } catch {
-          // Skip invalid JSON lines
+          return; // Skip invalid JSON lines
         }
-      }
 
-      // Use first user prompt as fallback if no summary
-      if (!session.summary && firstUserPrompt) {
-        session.summary = this.truncateName(firstUserPrompt);
-      }
+        // Get summary (prefer the last one as it's usually most descriptive)
+        if (entry.type === 'summary' && entry.summary) {
+          session.summary = entry.summary as string;
+        }
+
+        // Get recap from away_summary entries — keep the most recent by timestamp
+        if (entry.type === 'system' && entry.subtype === 'away_summary' && entry.content) {
+          const ts = entry.timestamp ? new Date(entry.timestamp as string).getTime() : 0;
+          if (ts >= latestRecapTimestamp) {
+            latestRecapTimestamp = ts;
+            // Strip the trailing "(disable recaps in /config)" hint
+            session.recap = (entry.content as string).replace(/\s*\(disable recaps in \/config\)\s*$/, '').trim();
+          }
+        }
+
+        // Get first user prompt as fallback for summary
+        if (!firstUserPrompt && entry.type === 'user' && entry.message) {
+          const text = this.extractUserText(entry.message);
+          if (text) {
+            firstUserPrompt = text;
+          }
+        }
+
+        // Get cwd and branch from user/assistant messages
+        if (entry.cwd && !session.cwd) {
+          session.cwd = entry.cwd as string;
+        }
+
+        if (entry.gitBranch && !session.gitBranch) {
+          session.gitBranch = entry.gitBranch as string;
+        }
+
+        // Count messages
+        if (entry.type === 'user' || entry.type === 'assistant') {
+          session.messageCount++;
+        }
+      });
     } catch {
       return null;
     }
 
-    // Skip sessions without a working directory
-    if (!session.cwd) {
-      return null;
+    // Use first user prompt as fallback if no summary
+    if (!session.summary && firstUserPrompt) {
+      session.summary = this.truncateName(firstUserPrompt);
     }
 
-    return session;
+    // Skip sessions without a working directory
+    const result = session.cwd ? session : null;
+    this.parseCache.set(filePath, { mtimeMs: stats.mtimeMs, size: stats.size, session: result });
+    return result;
   }
 
   /**
@@ -316,50 +374,68 @@ export class ClaudeSessionService {
    * This is faster than full parsing - just checks for user/assistant messages
    */
   isSessionResumable(sessionId: string): boolean {
-    const projectDirs = this.getProjectDirs();
+    const filePath = this.findSessionFilePath(sessionId);
+    if (!filePath) {
+      return false;
+    }
 
-    for (const dir of projectDirs) {
-      const filePath = path.join(dir, `${sessionId}.jsonl`);
-      if (!fs.existsSync(filePath)) {
-        continue;
-      }
-
+    // A resumable session has user/assistant messages, which appear at the very start
+    // of the log. Read only a bounded prefix (not the whole, possibly multi-MB, file) so
+    // this stays cheap and never blocks — it's called synchronously before opening a terminal.
+    const maxBytes = 512 * 1024;
+    try {
+      const fd = fs.openSync(filePath, 'r');
       try {
-        const content = fs.readFileSync(filePath, 'utf-8');
-        const lines = content.split('\n');
+        const buf = Buffer.alloc(maxBytes);
+        const bytesRead = fs.readSync(fd, buf, 0, maxBytes, 0);
+        const text = buf.subarray(0, bytesRead).toString('utf-8');
+        const lines = text.split('\n');
+        // Drop a trailing partial line if we filled the buffer (the file continues past it).
+        const complete = bytesRead >= maxBytes ? lines.slice(0, -1) : lines;
 
-        for (const line of lines) {
+        for (const line of complete) {
           if (!line.trim()) continue;
           try {
             const entry = JSON.parse(line);
-            // A session is resumable if it has user or assistant messages
             if (entry.type === 'user' || entry.type === 'assistant') {
               return true;
             }
           } catch {
-            // Skip invalid JSON
+            // Skip invalid/partial JSON
           }
         }
-        // File exists but no conversation content
-        return false;
-      } catch {
-        return false;
-      }
-    }
 
-    // Session file not found
-    return false;
+        // No conversation found in the prefix. If the file is larger than what we read,
+        // assume it's resumable rather than risk hiding a real session.
+        return bytesRead >= maxBytes;
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return false;
+    }
   }
 
   /**
-   * Encode a worktree path to Claude's project directory format
-   * Claude replaces all path separators and dots with dashes
-   * (Based on CCManager's pathToClaudeProjectName implementation)
+   * Encode a worktree path to Claude's project directory format.
+   * Claude Code replaces every non-alphanumeric character with a dash — including
+   * the Windows drive colon and spaces, not just separators and dots. Getting this
+   * exactly right is required for forking (the destination folder must be the name
+   * Claude will later compute for that worktree) and for session auto-linking.
    */
   encodeProjectPath(worktreePath: string): string {
     const normalizedPath = path.resolve(worktreePath);
-    // Replace all forward slashes, backslashes, and dots with dashes
-    return normalizedPath.replace(/[/\\.]/g, '-');
+    return normalizedPath.replace(/[^a-zA-Z0-9]/g, '-');
+  }
+
+  /**
+   * Find the project directory that actually contains a given session file.
+   * More robust than encoding a path, since forked/copied sessions can live in a
+   * directory whose name was derived from a different cwd.
+   */
+  private findProjectDirForSession(sessionId: string): string | null {
+    const fp = this.findSessionFilePath(sessionId);
+    return fp ? path.dirname(fp) : null;
   }
 
   /**
@@ -377,7 +453,10 @@ export class ClaudeSessionService {
    */
   copySessionToWorktree(sessionId: string, sourceWorktreePath: string, destWorktreePath: string): boolean {
     try {
-      const sourceProjectDir = this.getProjectDir(sourceWorktreePath);
+      // Prefer the directory that actually holds the session file; fall back to the
+      // encoded source path only if the file can't be located that way.
+      const sourceProjectDir = this.findProjectDirForSession(sessionId)
+        ?? this.getProjectDir(sourceWorktreePath);
       const destProjectDir = this.getProjectDir(destWorktreePath);
 
       if (!fs.existsSync(sourceProjectDir)) {
@@ -401,109 +480,76 @@ export class ClaudeSessionService {
   }
 
   /**
-   * Get the last few user messages from a session (for preview)
+   * Get the last few user messages from a session (for preview).
+   * Streamed with a rolling buffer so only the last N messages are ever held in memory.
    */
-  getSessionPreview(sessionId: string, maxMessages: number = 3): string[] {
-    const projectDirs = this.getProjectDirs();
-    const messages: string[] = [];
-
-    for (const dir of projectDirs) {
-      const filePath = path.join(dir, `${sessionId}.jsonl`);
-      if (!fs.existsSync(filePath)) {
-        continue;
-      }
-
-      try {
-        const content = fs.readFileSync(filePath, 'utf-8');
-        const lines = content.split('\n');
-
-        // Collect user messages
-        const userMessages: string[] = [];
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const entry = JSON.parse(line);
-            if (entry.type === 'user' && entry.message) {
-              // Get the text content from the message
-              let text = '';
-              if (typeof entry.message === 'string') {
-                text = entry.message;
-              } else if (entry.message.content) {
-                // Handle array of content blocks
-                if (Array.isArray(entry.message.content)) {
-                  for (const block of entry.message.content) {
-                    if (block.type === 'text' && block.text) {
-                      text = block.text;
-                      break;
-                    }
-                  }
-                } else if (typeof entry.message.content === 'string') {
-                  text = entry.message.content;
-                }
-              }
-              if (text) {
-                // Truncate long messages
-                const truncated = text.length > 100 ? text.substring(0, 100) + '...' : text;
-                userMessages.push(truncated.replace(/\n/g, ' '));
-              }
-            }
-          } catch {
-            // Skip invalid lines
-          }
-        }
-
-        // Return last N messages
-        return userMessages.slice(-maxMessages);
-      } catch {
-        return [];
-      }
+  async getSessionPreview(sessionId: string, maxMessages: number = 3): Promise<string[]> {
+    const filePath = this.findSessionFilePath(sessionId);
+    if (!filePath) {
+      return [];
     }
 
-    return messages;
+    const recent: string[] = [];
+    try {
+      await this.streamLines(filePath, (line) => {
+        if (!line.trim()) return;
+        let entry: Record<string, unknown>;
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          return; // Skip invalid lines
+        }
+        if (entry.type === 'user' && entry.message) {
+          const text = this.extractUserText(entry.message);
+          if (text) {
+            const truncated = text.length > 100 ? text.substring(0, 100) + '...' : text;
+            recent.push(truncated.replace(/\n/g, ' '));
+            if (recent.length > maxMessages) {
+              recent.shift();
+            }
+          }
+        }
+      });
+    } catch {
+      return [];
+    }
+
+    return recent;
   }
 
   /**
-   * Get the most recent recap for a session (from away_summary entries)
+   * Get the most recent recap for a session (from away_summary entries).
    */
-  getSessionRecap(sessionId: string): string | null {
-    const projectDirs = this.getProjectDirs();
-
-    for (const dir of projectDirs) {
-      const filePath = path.join(dir, `${sessionId}.jsonl`);
-      if (!fs.existsSync(filePath)) {
-        continue;
-      }
-
-      try {
-        const content = fs.readFileSync(filePath, 'utf-8');
-        let latestRecap: string | null = null;
-        let latestTs = 0;
-
-        for (const line of content.split('\n')) {
-          if (!line.trim()) { continue; }
-          try {
-            const entry = JSON.parse(line);
-            if (entry.type === 'system' && entry.subtype === 'away_summary' && entry.content) {
-              const ts = entry.timestamp ? new Date(entry.timestamp).getTime() : 0;
-              if (ts >= latestTs) {
-                latestTs = ts;
-                latestRecap = entry.content.replace(/\s*\(disable recaps in \/config\)\s*$/, '').trim();
-              }
-            }
-          } catch {
-            // skip
-          }
-        }
-
-        if (latestRecap) {
-          return latestRecap;
-        }
-      } catch {
-        // skip
-      }
+  async getSessionRecap(sessionId: string): Promise<string | null> {
+    const filePath = this.findSessionFilePath(sessionId);
+    if (!filePath) {
+      return null;
     }
 
-    return null;
+    let latestRecap: string | null = null;
+    let latestTs = 0;
+    try {
+      await this.streamLines(filePath, (line) => {
+        if (!line.trim()) return;
+        let entry: Record<string, unknown>;
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          return;
+        }
+        if (entry.type === 'system' && entry.subtype === 'away_summary' && entry.content) {
+          const ts = entry.timestamp ? new Date(entry.timestamp as string).getTime() : 0;
+          if (ts >= latestTs) {
+            latestTs = ts;
+            latestRecap = (entry.content as string).replace(/\s*\(disable recaps in \/config\)\s*$/, '').trim();
+          }
+        }
+      });
+    } catch {
+      return null;
+    }
+
+    return latestRecap;
   }
 
   /**

@@ -285,12 +285,14 @@ export class SessionWatcher {
   }
 
   /**
-   * Encode a path to match Claude's project directory naming
-   * Claude replaces forward slashes, backslashes, and dots with dashes
+   * Encode a path to match Claude's project directory naming.
+   * Claude Code replaces every non-alphanumeric character with a dash (including the
+   * Windows drive colon and spaces), so matching only separators and dots would never
+   * line up with the real folder name.
    */
   private encodeProjectPath(projectPath: string): string {
     const normalizedPath = path.resolve(projectPath);
-    return normalizedPath.replace(/[/\\.]/g, '-');
+    return normalizedPath.replace(/[^a-zA-Z0-9]/g, '-');
   }
 
   /**
@@ -334,8 +336,23 @@ export class SessionWatcher {
         return null;
       }
 
-      const content = fs.readFileSync(filePath, 'utf-8');
-      const lines = content.split('\n');
+      // Read only a bounded prefix. The summary and first user prompt appear near the
+      // top of the log, and this runs on a 5s poll, so we must not read a whole large file.
+      const maxBytes = 512 * 1024;
+      const fd = fs.openSync(filePath, 'r');
+      let content: string;
+      let truncated: boolean;
+      try {
+        const buf = Buffer.alloc(maxBytes);
+        const bytesRead = fs.readSync(fd, buf, 0, maxBytes, 0);
+        content = buf.subarray(0, bytesRead).toString('utf-8');
+        truncated = bytesRead >= maxBytes;
+      } finally {
+        fs.closeSync(fd);
+      }
+      const rawLines = content.split('\n');
+      // Drop a trailing partial line if we hit the byte cap.
+      const lines = truncated ? rawLines.slice(0, -1) : rawLines;
 
       let summary: string | null = null;
       let firstUserPrompt: string | null = null;

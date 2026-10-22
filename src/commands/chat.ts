@@ -340,10 +340,11 @@ export function registerChatCommands(
         try {
           if (item.isStaged) {
             // Check if file exists in HEAD (for newly added staged files, it won't)
-            const { execSync } = await import('child_process');
+            // execFile with an argument array — never interpolate paths into a shell string.
+            const { execFileSync } = await import('child_process');
             let existsInHead = true;
             try {
-              execSync(`git cat-file -e HEAD:"${item.change.path}"`, {
+              execFileSync('git', ['cat-file', '-e', `HEAD:${item.change.path}`], {
                 cwd: item.worktreePath,
                 stdio: ['pipe', 'pipe', 'pipe'],
               });
@@ -806,14 +807,16 @@ export function registerChatCommands(
           return date.toLocaleDateString();
         };
 
-        // Pre-compute previews for all sessions
+        // Pre-compute previews for all sessions (in parallel; each read is streamed/cached)
         const previewCache = new Map<string, string[]>();
-        for (const session of allSessions) {
-          previewCache.set(
-            session.sessionId,
-            claudeSessionService.getSessionPreview(session.sessionId, 5)
-          );
-        }
+        await Promise.all(
+          allSessions.map(async (session) => {
+            previewCache.set(
+              session.sessionId,
+              await claudeSessionService.getSessionPreview(session.sessionId, 5)
+            );
+          })
+        );
 
         const quickPickItems: SessionQuickPickItem[] = [];
         for (const [, { worktree: wt, sessions }] of sessionsByWorktree) {

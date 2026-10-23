@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { FileTreeItem, FilesTreeProvider } from '../providers/FilesTreeProvider';
+import { GitService, describeGitError } from '../services/GitService';
 import { resolveNewEntryPath, samePath } from '../utils/paths';
 
 async function pathExists(uri: vscode.Uri): Promise<boolean> {
@@ -68,7 +69,8 @@ async function uniqueDestUri(targetDirUri: vscode.Uri, sourceUri: vscode.Uri): P
 
 export function registerFileCommands(
   context: vscode.ExtensionContext,
-  filesProvider: FilesTreeProvider
+  filesProvider: FilesTreeProvider,
+  gitService: GitService
 ): void {
   context.subscriptions.push(
     vscode.commands.registerCommand('agntree.files.search', () => {
@@ -146,6 +148,26 @@ export function registerFileCommands(
       const name = path.basename(item.uri.fsPath);
       const isFolder = (item.fileType & vscode.FileType.Directory) !== 0;
       const kind = isFolder ? 'folder' : 'file';
+
+      // A folder can hold other worktrees (Claude Code puts them in .claude/worktrees/),
+      // with uncommitted work git can't bring back. Refuse rather than delete them too.
+      const worktree = filesProvider.getActiveWorktree();
+      if (isFolder && worktree) {
+        let inside: string[];
+        try {
+          inside = await gitService.worktreesWithin(worktree.path, item.uri.fsPath);
+        } catch (error) {
+          vscode.window.showErrorMessage(`Couldn't check whether "${name}" holds a git worktree, so it was not deleted: ${describeGitError(error)}`);
+          return;
+        }
+        if (inside.length > 0) {
+          vscode.window.showErrorMessage(
+            `"${name}" contains ${inside.length === 1 ? 'a git worktree' : `${inside.length} git worktrees`} (${inside.join(', ')}), so it was not deleted. ` +
+              'Delete those worktrees from the Workspaces view first.'
+          );
+          return;
+        }
+      }
       // Remote windows (Remote-SSH, which Coder uses, WSL, containers) have no trash, and
       // VS Code refuses useTrash there, so say up front that the delete is permanent.
       const remote = vscode.env.remoteName;

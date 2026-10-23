@@ -1,302 +1,125 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import * as vscode from 'vscode';
-import { StorageService } from './StorageService';
-import { Worktree } from '../types';
-import { SessionNamer, claudeConfigDir } from '../utils/sessionLog';
+import type { StorageService } from './StorageService';
+import { ClaudeSessionService } from './ClaudeSessionService';
+import { ChatSession } from '../types';
+import { SessionNamer } from '../utils/sessionLog';
 
 interface PendingChat {
-  chatId: string;
+  sessionId: string;
   worktreePath: string;
-  createdAt: number;
 }
 
+/** The part of StorageService the watcher uses (so it can be tested without VS Code). */
+export type ChatStore = Pick<StorageService, 'getChat' | 'getChats' | 'updateChat' | 'renameChat'>;
+
+type NameListener = (event: { chatId: string; name: string }) => void;
+
 /**
- * Watches for new Claude Code sessions and auto-links them to pending chats.
- * Monitors .jsonl files directly since sessions-index.json may not update immediately.
+ * Links chats to the Claude Code sessions they start, and names chats after them.
+ *
+ * Every chat is started with an ID chosen in advance (`claude --session-id <id>`), so its
+ * log is `<id>.jsonl` and nothing has to be guessed. (Matching the next new log in the
+ * worktree's project folder linked chats to sessions other chats, Quick Actions or
+ * other terminals had started.) Claude Code writes the log when the first prompt is
+ * sent; until then the chat is pending and this polls for the file.
  */
 export class SessionWatcher {
-  private projectsDir: string;
-  private projectWatchers: Map<string, fs.FSWatcher> = new Map();
-  private pendingChats: PendingChat[] = [];
-  private monitoringIntervals: Map<string, NodeJS.Timeout> = new Map();
-  private knownSessions: Set<string> = new Set();
-
-  /** Event emitter for when a chat name is updated */
-  private _onChatNameUpdated = new vscode.EventEmitter<{ chatId: string; name: string }>();
-  public readonly onChatNameUpdated = this._onChatNameUpdated.event;
-
-  constructor(private storageService: StorageService) {
-    this.projectsDir = path.join(claudeConfigDir(), 'projects');
-  }
-
-  private isSessionFile(filename: string): boolean {
-    return filename.endsWith('.jsonl') && !filename.startsWith('agent-');
-  }
-
-  /**
-   * Start watching for new Claude sessions
-   */
-  startWatching(): void {
-    if (!fs.existsSync(this.projectsDir)) {
-      console.log('Claude projects directory does not exist yet');
-      return;
-    }
-
-    // Catalog all existing sessions so we know what's new
-    this.catalogExistingSessions();
-    this.watchExistingProjectDirs();
-  }
-
-  /**
-   * Build a set of all existing session IDs
-   */
-  private catalogExistingSessions(): void {
-    try {
-      const dirs = fs.readdirSync(this.projectsDir)
-        .filter(name => !name.startsWith('.'))
-        .map(name => path.join(this.projectsDir, name))
-        .filter(p => {
-          try {
-            return fs.statSync(p).isDirectory();
-          } catch {
-            return false;
-          }
-        });
-
-      for (const dir of dirs) {
-        try {
-          const files = fs.readdirSync(dir);
-          for (const file of files) {
-            if (this.isSessionFile(file)) {
-              const sessionId = file.replace('.jsonl', '');
-              this.knownSessions.add(sessionId);
-            }
-          }
-        } catch {
-          // Skip directories we can't read
-        }
-      }
-      console.log(`Cataloged ${this.knownSessions.size} existing sessions`);
-    } catch (error) {
-      console.error('Failed to catalog existing sessions:', error);
-    }
-  }
-
-  /**
-   * Watch all existing project directories for new session files
-   */
-  private watchExistingProjectDirs(): void {
-    try {
-      const dirs = fs.readdirSync(this.projectsDir)
-        .filter(name => !name.startsWith('.'))
-        .map(name => path.join(this.projectsDir, name))
-        .filter(p => {
-          try {
-            return fs.statSync(p).isDirectory();
-          } catch {
-            return false;
-          }
-        });
-
-      for (const dir of dirs) {
-        this.watchProjectDir(dir);
-      }
-    } catch (error) {
-      console.error('Failed to watch existing project dirs:', error);
-    }
-  }
-
-  /**
-   * Watch a project directory for new session files
-   */
-  private watchProjectDir(dirPath: string): void {
-    if (this.projectWatchers.has(dirPath)) {
-      return; // Already watching
-    }
-
-    try {
-      const watcher = fs.watch(dirPath, { persistent: false }, (_eventType, filename) => {
-        if (filename && this.isSessionFile(filename)) {
-          const sessionId = filename.replace('.jsonl', '');
-
-          // Only process sessions we haven't seen before
-          if (!this.knownSessions.has(sessionId)) {
-            this.knownSessions.add(sessionId);
-            const filePath = path.join(dirPath, filename);
-            this.handleNewSession(filePath, sessionId, dirPath);
-          }
-        }
-      });
-
-      this.projectWatchers.set(dirPath, watcher);
-    } catch (error) {
-      console.error(`Failed to watch project dir ${dirPath}:`, error);
-    }
-  }
-
-  /**
-   * Handle a newly created session file
-   */
-  private handleNewSession(filePath: string, sessionId: string, projectDir: string): void {
-    if (this.pendingChats.length === 0) {
-      return;
-    }
-
-    // Use the project directory name to match pending chats
-    // This is more reliable than parsing cwd from the session file, which may only have snapshot entries
-    const projectDirName = path.basename(projectDir);
-    this.linkSessionToChatByProjectDir(filePath, sessionId, projectDirName);
-  }
-
-  /**
-   * Try to link a session to a pending chat using project directory name
-   * This matches the encoded worktree path to the project directory name
-   */
-  private linkSessionToChatByProjectDir(filePath: string, sessionId: string, projectDirName: string): void {
-    // Find a matching pending chat by comparing encoded paths
-    for (let i = this.pendingChats.length - 1; i >= 0; i--) {
-      const pending = this.pendingChats[i];
-      const encodedWorktreePath = this.encodeProjectPath(pending.worktreePath);
-
-      // Check if the encoded worktree path matches the project directory name
-      if (encodedWorktreePath === projectDirName) {
-        // Found a match! Link the session to the chat
-        const chat = this.storageService.getChat(pending.chatId);
-        if (chat && !chat.claudeSessionId) {
-          this.storageService.updateChat(pending.chatId, {
-            claudeSessionId: sessionId,
-          });
-
-          // Remove from pending
-          this.pendingChats.splice(i, 1);
-
-          // Start monitoring for name updates
-          this.monitorSessionForName(pending.chatId, filePath);
-
-          console.log(`[SessionWatcher] Linked session ${sessionId} to chat ${pending.chatId}`);
-          return;
-        }
-      }
-    }
-  }
-
-  /**
-   * Register a chat as pending for session linkage
-   */
-  registerPendingChat(chatId: string, worktree: Worktree): void {
-    // Remove any existing pending entry for this chat
-    this.pendingChats = this.pendingChats.filter(p => p.chatId !== chatId);
-
-    this.pendingChats.push({
-      chatId,
-      worktreePath: worktree.path,
-      createdAt: Date.now(),
-    });
-
-    // Ensure we're watching the correct project directory
-    const encodedPath = this.encodeProjectPath(worktree.path);
-    const projectDir = path.join(this.projectsDir, encodedPath);
-    if (fs.existsSync(projectDir)) {
-      this.watchProjectDir(projectDir);
-      this.scanForUnlinkedSessions(projectDir);
-    } else {
-      // Directory doesn't exist yet — retry until it appears or chat is no longer active
-      const retryInterval = setInterval(() => {
-        const chat = this.storageService.getChat(chatId);
-        if (!chat || chat.status !== 'active') {
-          clearInterval(retryInterval);
-          return;
-        }
-        if (fs.existsSync(projectDir)) {
-          clearInterval(retryInterval);
-          this.watchProjectDir(projectDir);
-          this.scanForUnlinkedSessions(projectDir);
-        }
-      }, 5000);
-      this.monitoringIntervals.set(`dir-${chatId}`, retryInterval);
-    }
-
-    this.ensurePendingChatPoller(projectDir);
-
-    // Clean up old pending chats (older than 5 minutes)
-    const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
-    this.pendingChats = this.pendingChats.filter(p => p.createdAt > fiveMinutesAgo);
-  }
-
-  /** Scan for recent session files that weren't caught by fs.watch. */
-  private scanForUnlinkedSessions(dirPath: string): void {
-    if (this.pendingChats.length === 0) {
-      return;
-    }
-
-    try {
-      const files = fs.readdirSync(dirPath);
-      const projectDirName = path.basename(dirPath);
-      // Only consider files created in the last 2 minutes
-      const cutoff = Date.now() - 2 * 60 * 1000;
-
-      for (const file of files) {
-        if (!this.isSessionFile(file)) {
-          continue;
-        }
-        const filePath = path.join(dirPath, file);
-        try {
-          const stat = fs.statSync(filePath);
-          if (stat.birthtimeMs < cutoff) {
-            continue;
-          }
-        } catch {
-          continue;
-        }
-        const sessionId = file.replace('.jsonl', '');
-        this.knownSessions.add(sessionId);
-        this.linkSessionToChatByProjectDir(filePath, sessionId, projectDirName);
-      }
-    } catch {
-      // Directory may not be readable yet
-    }
-  }
-
-  /**
-   * Polling fallback — fs.watch on macOS can miss or coalesce events.
-   */
-  private ensurePendingChatPoller(projectDir: string): void {
-    const pollerKey = `poller-${projectDir}`;
-    if (this.monitoringIntervals.has(pollerKey)) {
-      return;
-    }
-
-    const projectDirName = path.basename(projectDir);
-    const poller = setInterval(() => {
-      const hasPendingForDir = this.pendingChats.some(
-        p => this.encodeProjectPath(p.worktreePath) === projectDirName
-      );
-      if (!hasPendingForDir) {
-        clearInterval(poller);
-        this.monitoringIntervals.delete(pollerKey);
-        return;
-      }
-
-      this.scanForUnlinkedSessions(projectDir);
-    }, 5000);
-
-    this.monitoringIntervals.set(pollerKey, poller);
-  }
-
-  /**
-   * Encode a path to match Claude's project directory naming.
-   * Claude Code replaces every non-alphanumeric character with a dash (including the
-   * Windows drive colon and spaces), so matching only separators and dots would never
-   * line up with the real folder name.
-   */
-  private encodeProjectPath(projectPath: string): string {
-    const normalizedPath = path.resolve(projectPath);
-    return normalizedPath.replace(/[^a-zA-Z0-9]/g, '-');
-  }
-
+  private static readonly POLL_MS = 2000;
   /** How long to keep waiting for Claude Code to record a title after naming a chat from its first prompt. */
   private static readonly TITLE_WAIT_MS = 10 * 60 * 1000;
+  /** Give up naming a chat if its log shows no prompt or title for this long. */
+  private static readonly NAME_WAIT_MS = 30 * 60 * 1000;
+
+  /** Pending chats by chat ID */
+  private pending = new Map<string, PendingChat>();
+  private poller: NodeJS.Timeout | undefined;
+  private nameMonitors = new Map<string, NodeJS.Timeout>();
+  private nameListeners = new Set<NameListener>();
+
+  constructor(
+    private storageService: ChatStore,
+    private readonly sessions: ClaudeSessionService = new ClaudeSessionService()
+  ) {}
+
+  /** Call `listener` when a chat is renamed after its session. */
+  onChatNameUpdated(listener: NameListener): { dispose(): void } {
+    this.nameListeners.add(listener);
+    return { dispose: () => this.nameListeners.delete(listener) };
+  }
+
+  /**
+   * Pick up chats that were started but not linked before this window (re)loaded, e.g.
+   * after an extension host restart. Their worktree paths come from `worktreePathOf`.
+   */
+  resumePending(worktreePathOf: (chat: ChatSession) => Promise<string | undefined>): void {
+    for (const chat of this.storageService.getChats()) {
+      if (!chat.claudeSessionId && chat.pendingSessionId) {
+        const sessionId = chat.pendingSessionId;
+        worktreePathOf(chat).then(
+          (worktreePath) => worktreePath && this.watchForSession(chat.id, sessionId, worktreePath),
+          () => undefined
+        );
+      }
+    }
+  }
+
+  /** Wait for session `sessionId`, started in `worktreePath`, to write its log, then link it to the chat. */
+  watchForSession(chatId: string, sessionId: string, worktreePath: string): void {
+    this.pending.set(chatId, { sessionId, worktreePath });
+    if (!this.poller) {
+      this.poller = setInterval(() => this.poll(), SessionWatcher.POLL_MS);
+    }
+  }
+
+  /**
+   * Link the chat now if its session has written a log. Returns the updated chat, or
+   * undefined if it hasn't started (or the chat no longer exists).
+   * @param requireConversation only link a log that holds a prompt or reply
+   */
+  linkIfStarted(chatId: string, worktreePath: string, options: { requireConversation?: boolean } = {}): ChatSession | undefined {
+    const chat = this.storageService.getChat(chatId);
+    if (!chat) {
+      this.pending.delete(chatId);
+      return undefined;
+    }
+    if (chat.claudeSessionId) {
+      this.pending.delete(chatId);
+      return chat;
+    }
+    const sessionId = chat.pendingSessionId;
+    if (!sessionId) {
+      return undefined;
+    }
+    const logPath = this.sessions.findSessionLog(sessionId, worktreePath);
+    if (!logPath || (options.requireConversation && !this.sessions.isSessionResumable(sessionId))) {
+      return undefined;
+    }
+    const linked = this.storageService.updateChat(chatId, {
+      claudeSessionId: sessionId,
+      pendingSessionId: undefined,
+      forkFromSessionId: undefined,
+    });
+    this.pending.delete(chatId);
+    this.monitorSessionForName(chatId, logPath);
+    console.log(`[SessionWatcher] Linked session ${sessionId} to chat ${chatId}`);
+    return linked;
+  }
+
+  private poll(): void {
+    for (const [chatId, pending] of [...this.pending]) {
+      const chat = this.storageService.getChat(chatId);
+      if (!chat || chat.claudeSessionId || chat.pendingSessionId !== pending.sessionId) {
+        // Deleted, linked by another window, or restarted with a different ID
+        this.pending.delete(chatId);
+        continue;
+      }
+      this.linkIfStarted(chatId, pending.worktreePath);
+    }
+    if (this.pending.size === 0 && this.poller) {
+      clearInterval(this.poller);
+      this.poller = undefined;
+    }
+  }
 
   /**
    * Monitor a session file for its name. The first prompt names the chat as soon as it is
@@ -305,28 +128,32 @@ export class SessionWatcher {
    */
   private monitorSessionForName(chatId: string, sessionFilePath: string): void {
     // Clear any existing interval for this chat
-    const existingInterval = this.monitoringIntervals.get(chatId);
+    const existingInterval = this.nameMonitors.get(chatId);
     if (existingInterval) {
       clearInterval(existingInterval);
     }
 
+    const startedAt = Date.now();
     let autoName: string | undefined;
     let namedAt = 0;
     const stop = () => {
       clearInterval(checkInterval);
-      this.monitoringIntervals.delete(chatId);
+      this.nameMonitors.delete(chatId);
     };
     const rename = (name: string) => {
       this.storageService.renameChat(chatId, name);
-      this._onChatNameUpdated.fire({ chatId, name });
+      for (const listener of this.nameListeners) {
+        listener({ chatId, name });
+      }
     };
 
     const checkInterval = setInterval(() => {
       const chat = this.storageService.getChat(chatId);
       const stillAutoNamed = chat && (chat.name.startsWith('New Session') || chat.name === autoName);
 
-      // Stop if chat was deleted, renamed by the user, or session is no longer running
-      if (!chat || !stillAutoNamed || chat.status !== 'active') {
+      // Stop if the chat was deleted or renamed by the user. (Not on its stored status:
+      // that is shared by every window on this machine, and another window resets it.)
+      if (!chat || !stillAutoNamed) {
         stop();
         return;
       }
@@ -344,10 +171,12 @@ export class SessionWatcher {
         rename(name);
       } else if (autoName !== undefined && Date.now() - namedAt > SessionWatcher.TITLE_WAIT_MS) {
         stop(); // named from the first prompt; Claude Code never recorded a title
+      } else if (autoName === undefined && Date.now() - startedAt > SessionWatcher.NAME_WAIT_MS) {
+        stop();
       }
     }, 5000);
 
-    this.monitoringIntervals.set(chatId, checkInterval);
+    this.nameMonitors.set(chatId, checkInterval);
   }
 
   /** Read a session log's title and first prompt. */
@@ -394,16 +223,16 @@ export class SessionWatcher {
    * Stop watching and clean up
    */
   dispose(): void {
-    for (const watcher of this.projectWatchers.values()) {
-      watcher.close();
+    if (this.poller) {
+      clearInterval(this.poller);
+      this.poller = undefined;
     }
-    this.projectWatchers.clear();
+    this.pending.clear();
 
-    for (const interval of this.monitoringIntervals.values()) {
+    for (const interval of this.nameMonitors.values()) {
       clearInterval(interval);
     }
-    this.monitoringIntervals.clear();
-
-    this._onChatNameUpdated.dispose();
+    this.nameMonitors.clear();
+    this.nameListeners.clear();
   }
 }

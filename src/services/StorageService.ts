@@ -169,7 +169,12 @@ export class StorageService implements vscode.Disposable {
   /**
    * Create a new chat session
    */
-  createChat(worktreeId: string, name: string, baseCommit: string | null = null): ChatSession {
+  createChat(
+    worktreeId: string,
+    name: string,
+    baseCommit: string | null = null,
+    launch: Pick<ChatSession, 'pendingSessionId' | 'forkFromSessionId'> = {}
+  ): ChatSession {
     const chat: ChatSession = {
       id: generateId(),
       worktreeId,
@@ -179,6 +184,7 @@ export class StorageService implements vscode.Disposable {
       lastAccessedAt: Date.now(),
       status: 'idle',
       baseCommit,
+      ...launch,
     };
     this.store.update((state) => {
       state.chats.push(chat);

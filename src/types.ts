@@ -47,8 +47,16 @@ export interface ChatSession {
   worktreeId: string;
   /** User-defined name for the chat */
   name: string;
-  /** Claude Code session ID for --resume flag */
+  /** Claude Code session ID for --resume flag, set once its log exists */
   claudeSessionId: string | null;
+  /**
+   * The ID Agntree gave Claude Code (`--session-id`) for a session that hasn't written
+   * its log yet. It becomes `claudeSessionId` when the log `<id>.jsonl` appears, so a
+   * chat is only ever linked to the session it started.
+   */
+  pendingSessionId?: string;
+  /** For a fork that hasn't started yet: the session it copies its history from */
+  forkFromSessionId?: string;
   /** Unix timestamp of creation */
   createdAt: number;
   /** Unix timestamp of last access */

@@ -21,7 +21,7 @@ To test during development: Press F5 in VS Code to launch the Extension Developm
 
 Tests live in `src/test/*.test.ts` and use Node's built-in test runner (`node:test`). `scripts/test.js` bundles them with esbuild into `out-test/` and runs `node --test`, so there are no extra test dependencies.
 
-- Tests cover code that doesn't import `vscode`: `GitService` (against real temporary git repositories), `ClaudeSessionService` (against a fake `~/.claude`), `StateStore`, and the helpers in `src/utils/`. Keep logic you want tested out of the command and provider files.
+- Tests cover code that doesn't import `vscode`: `GitService` (against real temporary git repositories), `ClaudeSessionService` and `SessionWatcher` (against a fake `~/.claude`; the watcher takes a `ChatStore` instead of `StorageService`), `LiveSessionService`, `StateStore`, and the helpers in `src/utils/`. Keep logic you want tested out of the command and provider files.
 - `src/test/helpers.ts` isolates git from your own config (`GIT_CONFIG_GLOBAL`, no system config), so signing, hooks or `autocrlf` can't change results.
 - Known bugs that aren't fixed yet are written as `{ todo: '...' }` tests: they run and report but don't fail the suite, and start passing when the bug is fixed.
 - Pass extra flags through to `node --test`, e.g. `node scripts/test.js --test-name-pattern=rename`.
@@ -55,7 +55,7 @@ Commands are registered in `package.json` under `contributes.commands` and imple
 
 1. User adds a repository → stored in this machine's state file
 2. GitService detects worktrees via `git worktree list --porcelain`
-3. User creates a session → TerminalManager spawns terminal with `claude --resume <sessionId>`
+3. User creates a session → TerminalManager starts it with `claude --session-id <uuid>` and resumes it later with `claude --resume <sessionId>` (see Session Linking)
 4. Sessions link to Claude Code's session files for resumption
 
 ### Key Types (`src/types.ts`)
@@ -71,6 +71,13 @@ Sessions are stored in `~/.claude/projects/<encoded-path>/*.jsonl` (`$CLAUDE_CON
 - Names come from `custom-title` entries (older logs: `summary`), else the first prompt the user typed. Claude Code puts its own text in user messages, wrapped in tags such as `<system-reminder>` or `<command-name>`, and marks some entries `isMeta`. `src/utils/sessionLog.ts` removes these, and both `ClaudeSessionService` and `SessionWatcher` use it.
 - Searches read only the project folders whose name starts with an encoded repository or worktree path. A machine can hold gigabytes of logs, and reading them all took minutes.
 
+### Session Linking
+
+- New chats and forks get a session ID before Claude starts (`ChatSession.pendingSessionId`; a fork also records `forkFromSessionId`). The terminal runs `claude --session-id <id>` or `claude --resume <src> --fork-session --session-id <id>` (`src/utils/claudeCommand.ts`, which refuses anything that isn't a UUID, since the command is typed into a shell).
+- `SessionWatcher` polls for that exact `<id>.jsonl` and then sets `claudeSessionId`. Never link a chat by "the next new log in this folder": Quick Actions, `/clear`, other terminals and the desktop app all create logs there.
+- `LiveSessionService` lists the Claude processes running on the machine (`claude agents --json`, else `<configDir>/sessions/<pid>.json` with a live pid; never read the `.key` files next to them). Use it before resuming a session that may be running elsewhere, or deleting a folder one runs in.
+- A chat's saved `status` is shared by every window on the machine. Don't make decisions with it; `TerminalManager.isActive()` is this window's view.
+
 ### Path Encoding
 
 Claude Code encodes directory paths by replacing `/`, `\`, and `.` with `-`. For example:
@@ -80,7 +87,7 @@ The `ClaudeSessionService.encodeProjectPath()` method handles this encoding when
 
 ### Session Forking
 
-When forking a session to a new worktree, the extension copies the entire project directory from `~/.claude/projects/<source>` to `~/.claude/projects/<dest>`. This preserves conversation history so Claude can resume from the forked point.
+When forking a session to a new worktree, the extension copies only that session (`<id>.jsonl` and its `<id>/` folder) from `~/.claude/projects/<source>` to `~/.claude/projects/<dest>`, because Claude Code looks sessions up in the folder named after its working directory. The new worktree then runs `claude --resume <id> --fork-session --session-id <new id>`, so the fork is a session of its own. Copying the whole folder listed every other session twice.
 
 ## Quick Actions
 
@@ -141,6 +148,16 @@ The `WorkspacesTreeProvider` watches `.git/HEAD` and `.git/worktrees/*/HEAD` fil
 `Worktree.name` is for display: the branch, or the folder name when HEAD is detached (for example mid-rebase). Anything that operates on a branch (delete, merge, PR lookup) must use `Worktree.branch`, which is `null` for detached worktrees. Using `name` once made "Delete Worktree & Branch" force-delete an unrelated branch that happened to share the folder's name.
 
 Deleting a branch goes through `GitService.deleteBranch()`, which refuses an unmerged branch (reporting how many commits would be lost) unless called with `force`; the command asks before forcing.
+
+### Deleting worktrees and folders
+
+- `git worktree remove` deletes worktrees nested inside the folder too, and Claude Code's `.claude/worktrees/` is usually ignored, so status doesn't show them. `GitService.removeWorktree()` refuses when `worktreesWithin()` finds one, and All Files → Delete does the same for folders.
+- A detached worktree's commits may be on no branch (`countCommitsOnNoBranch()`); Delete Worktree warns before losing them. `createWorktree()` gives a remote-tracking branch a local branch so this doesn't happen in the first place.
+- Changes panel and rebase commands act on the worktree path in the item (or argument) they were invoked with, never on "the active worktree" when one was given.
+
+### Git pathspecs
+
+`GitService` runs git with `GIT_LITERAL_PATHSPECS=1`, so file paths are never read as globs (`app/[id]/page.tsx`). Pathspec magic such as `:(exclude)` doesn't work under it.
 
 ## PR Checkout
 

@@ -1,12 +1,13 @@
+import { randomUUID } from 'crypto';
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { StorageService } from '../services/StorageService';
-import { GitService } from '../services/GitService';
+import { GitService, RebaseResult } from '../services/GitService';
 import { TerminalManager } from '../services/TerminalManager';
 import { ClaudeSessionService } from '../services/ClaudeSessionService';
-import { SessionWatcher } from '../services/SessionWatcher';
+import { LiveSessionService } from '../services/LiveSessionService';
 import { WorkspaceTreeItem, WorkspacesTreeProvider } from '../providers/WorkspacesTreeProvider';
-import { ChangesTreeProvider, ChangeTreeItem, ChangeSectionItem } from '../providers/ChangesTreeProvider';
+import { ChangesTreeProvider, ChangeTreeItem, ChangeSectionItem, RebaseSectionItem } from '../providers/ChangesTreeProvider';
 import { ChatSession, Worktree } from '../types';
 import { isWithin, samePath } from '../utils/paths';
 
@@ -20,9 +21,64 @@ export function registerChatCommands(
   terminalManager: TerminalManager,
   workspacesProvider: WorkspacesTreeProvider,
   changesProvider: ChangesTreeProvider,
-  sessionWatcher: SessionWatcher,
+  liveSessions: LiveSessionService,
   refreshTree: () => void
 ): void {
+  /** Ask before resuming a session whose Claude process is already running somewhere else. */
+  async function confirmNotRunningElsewhere(chat: ChatSession): Promise<boolean> {
+    const sessionId = storageService.getChat(chat.id)?.claudeSessionId ?? chat.claudeSessionId;
+    if (!sessionId) {
+      return true;
+    }
+    const running = await liveSessions.find(sessionId);
+    if (!running) {
+      return true;
+    }
+    const where = [running.pid ? `process ${running.pid}` : '', running.status ?? ''].filter(Boolean).join(', ');
+    const choice = await vscode.window.showWarningMessage(
+      `"${chat.name}" is already running${where ? ` (${where})` : ''}, in another window, the Claude desktop app or a terminal.`,
+      {
+        modal: true,
+        detail:
+          'Opening it here starts a second Claude on the same conversation, and both write to its history. ' +
+          'Switch to the one that is running, or fork the session instead.',
+      },
+      'Open Anyway'
+    );
+    return choice === 'Open Anyway';
+  }
+
+  /**
+   * The worktree a Changes panel action is for: the one whose section was clicked, else
+   * the worktree the panel shows. (The panel can switch worktree while a click is on its
+   * way, so never assume the active one when an item says otherwise.)
+   */
+  async function changesTarget(arg?: ChangeSectionItem | RebaseSectionItem | string): Promise<{ path: string; name: string } | undefined> {
+    const targetPath = typeof arg === 'string' ? arg : arg?.worktreePath ?? changesProvider.getActiveWorktree()?.path;
+    if (!targetPath) {
+      return undefined;
+    }
+    const worktree = await workspacesProvider.findWorktreeByPath(targetPath);
+    return { path: targetPath, name: worktree?.name ?? path.basename(targetPath) };
+  }
+
+  /** Tell the user how a rebase step went: finished, paused on conflicts, or failed. */
+  async function reportRebaseStep(result: RebaseResult, worktreePath: string, done: string, paused: string): Promise<void> {
+    if (result.ok) {
+      if (await gitService.isRebaseInProgress(worktreePath)) {
+        vscode.window.showWarningMessage(paused);
+      } else {
+        vscode.window.showInformationMessage(done);
+        refreshTree();
+      }
+    } else if (result.autostashConflicts) {
+      vscode.window.showWarningMessage(result.error);
+      refreshTree();
+    } else {
+      vscode.window.showErrorMessage(result.error);
+    }
+    changesProvider.refresh();
+  }
   /** Let the user pick a worktree from every repository. */
   async function pickWorktree(placeHolder: string): Promise<Worktree | undefined> {
     const repos = storageService.getRepositories();
@@ -55,12 +111,10 @@ export function registerChatCommands(
         // Get current commit for change tracking
         const baseCommit = await gitService.getCurrentCommit(worktree.path);
 
-        // Create the chat immediately with a temporary name
-        // The name will be auto-updated when a summary or first prompt is available
-        const chat = storageService.createChat(worktree.id, 'New Session', baseCommit);
-
-        // Register for session detection and auto-naming
-        sessionWatcher.registerPendingChat(chat.id, worktree);
+        // Create the chat immediately with a temporary name. The name is updated from the
+        // first prompt or Claude Code's title once the session's log appears; the session
+        // ID is chosen now, so that log is found by name.
+        const chat = storageService.createChat(worktree.id, 'New Session', baseCommit, { pendingSessionId: randomUUID() });
 
         // Open in terminal
         terminalManager.openChat(chat, worktree);
@@ -87,6 +141,12 @@ export function registerChatCommands(
 
         if (!worktree) {
           vscode.window.showErrorMessage('Could not find worktree for this session.');
+          return;
+        }
+
+        // Resuming a session that is already running elsewhere (another window, the
+        // desktop app, a shell) starts a second Claude on the same conversation log.
+        if (!terminalManager.isActive(chat.id) && !(await confirmNotRunningElsewhere(chat))) {
           return;
         }
 
@@ -382,18 +442,18 @@ export function registerChatCommands(
           return;
         }
 
-        // Create new chat with unique fork name (short hash suffix)
+        // Create new chat with unique fork name (short hash suffix). The fork gets its own
+        // session ID now (`--fork-session --session-id`), so its log is found by name.
         const shortHash = Math.random().toString(36).substring(2, 6);
         const forkName = `Fork of ${chat.name} (${shortHash})`;
         const baseCommit = await gitService.getCurrentCommit(worktree.path);
-        const forkedChat = storageService.createChat(worktree.id, forkName, baseCommit);
-
-        // Register for session detection BEFORE opening terminal
-        // (the forked session will have a new ID that we need to capture)
-        sessionWatcher.registerPendingChat(forkedChat.id, worktree);
+        const forkedChat = storageService.createChat(worktree.id, forkName, baseCommit, {
+          pendingSessionId: randomUUID(),
+          forkFromSessionId: chat.claudeSessionId,
+        });
 
         // Open in terminal with fork flag
-        terminalManager.openChat(forkedChat, worktree, chat.claudeSessionId);
+        terminalManager.openChat(forkedChat, worktree);
 
         // Update changes view
         changesProvider.setActiveChat(forkedChat.id, worktree);
@@ -515,28 +575,28 @@ export function registerChatCommands(
           return;
         }
 
-        // Copy the session file to the new worktree's project folder
-        // This is required because Claude Code stores sessions per-directory
+        // Copy the session's log to the new worktree's project folder: Claude Code looks
+        // sessions up in the folder named after the directory it runs in.
         const sessionService = new ClaudeSessionService();
-        const sessionCopied = sessionService.copySessionToWorktree(
+        const sessionCopied = await sessionService.copySessionToWorktree(
           chat.claudeSessionId,
           worktree.path,
-          worktreePath
+          newWorktree.path
         );
 
         if (!sessionCopied) {
           vscode.window.showWarningMessage('Worktree created but session file could not be copied. The fork may not have conversation history.');
         }
 
-        // Create forked chat in the new worktree with the same session ID
-        // (since we copied the session files, we can just resume the same session)
+        // Fork it there into a session of its own (`--fork-session --session-id`), so the
+        // two chats don't share, and both write to, one session.
         const shortHash = Math.random().toString(36).substring(2, 6);
         const forkName = `Fork of ${chat.name} (${shortHash})`;
-        const forkedChat = storageService.createChat(newWorktree.id, forkName, currentCommit);
-        forkedChat.claudeSessionId = chat.claudeSessionId;
-        storageService.updateChat(forkedChat.id, { claudeSessionId: chat.claudeSessionId });
+        const forkedChat = storageService.createChat(newWorktree.id, forkName, currentCommit, {
+          pendingSessionId: randomUUID(),
+          forkFromSessionId: chat.claudeSessionId,
+        });
 
-        // Open in terminal - just resume since session files were copied
         terminalManager.openChat(forkedChat, newWorktree);
 
         // Update changes view
@@ -910,14 +970,14 @@ export function registerChatCommands(
     vscode.commands.registerCommand(
       'agntree.discardAll',
       async (item?: ChangeSectionItem) => {
-        const worktree = changesProvider.getActiveWorktree();
-        if (!worktree) {
+        const target = await changesTarget(item);
+        if (!target) {
           return;
         }
 
         const confirm = await vscode.window.showWarningMessage(
-          'Discard all unstaged changes and permanently delete all untracked files? Staged changes are kept. This cannot be undone.',
-          { modal: true },
+          `Discard all unstaged changes in "${target.name}" and permanently delete its untracked files?`,
+          { modal: true, detail: `${target.path}\n\nStaged changes are kept. This cannot be undone.` },
           'Discard All'
         );
 
@@ -925,11 +985,11 @@ export function registerChatCommands(
           return;
         }
 
-        const result = await gitService.discardAll(worktree.path);
+        const result = await gitService.discardAll(target.path);
         if (result.ok) {
           changesProvider.refresh();
         } else {
-          vscode.window.showErrorMessage(`Failed to discard all changes: ${result.error}`);
+          vscode.window.showErrorMessage(`Failed to discard all changes in "${target.name}": ${result.error}`);
         }
       }
     )
@@ -940,16 +1000,16 @@ export function registerChatCommands(
     vscode.commands.registerCommand(
       'agntree.stageAll',
       async (item?: ChangeSectionItem) => {
-        const worktree = changesProvider.getActiveWorktree();
-        if (!worktree) {
+        const target = await changesTarget(item);
+        if (!target) {
           return;
         }
 
-        const result = await gitService.stageAll(worktree.path);
+        const result = await gitService.stageAll(target.path);
         if (result.ok) {
           changesProvider.refresh();
         } else {
-          vscode.window.showErrorMessage(`Failed to stage all changes: ${result.error}`);
+          vscode.window.showErrorMessage(`Failed to stage all changes in "${target.name}": ${result.error}`);
         }
       }
     )
@@ -960,51 +1020,55 @@ export function registerChatCommands(
     vscode.commands.registerCommand(
       'agntree.unstageAll',
       async (item?: ChangeSectionItem) => {
-        const worktree = changesProvider.getActiveWorktree();
-        if (!worktree) {
+        const target = await changesTarget(item);
+        if (!target) {
           return;
         }
 
-        const result = await gitService.unstageAll(worktree.path);
+        const result = await gitService.unstageAll(target.path);
         if (result.ok) {
           changesProvider.refresh();
         } else {
-          vscode.window.showErrorMessage(`Failed to unstage all changes: ${result.error}`);
+          vscode.window.showErrorMessage(`Failed to unstage all changes in "${target.name}": ${result.error}`);
         }
       }
     )
   );
 
+  /**
+   * The worktree a rebase control is for (the Changes panel's rebase section, or a path
+   * from the worktree's Rebase menu), if it is mid-rebase.
+   */
+  async function rebaseTarget(arg?: RebaseSectionItem | string): Promise<{ path: string; name: string } | undefined> {
+    const target = await changesTarget(arg);
+    if (!target) {
+      vscode.window.showErrorMessage('No active worktree selected.');
+      return undefined;
+    }
+    if (!(await gitService.isRebaseInProgress(target.path))) {
+      vscode.window.showInformationMessage(`No rebase in progress in "${target.name}".`);
+      return undefined;
+    }
+    return target;
+  }
+
   // Rebase Continue
   context.subscriptions.push(
     vscode.commands.registerCommand(
       'agntree.rebaseContinue',
-      async () => {
-        const worktree = changesProvider.getActiveWorktree();
-        if (!worktree) {
-          vscode.window.showErrorMessage('No active worktree selected.');
+      async (arg?: RebaseSectionItem | string) => {
+        const target = await rebaseTarget(arg);
+        if (!target) {
           return;
         }
 
-        if (!(await gitService.isRebaseInProgress(worktree.path))) {
-          vscode.window.showInformationMessage('No rebase in progress.');
-          return;
-        }
-
-        const result = await gitService.rebaseContinue(worktree.path);
-        if (result.ok) {
-          if (await gitService.isRebaseInProgress(worktree.path)) {
-            vscode.window.showWarningMessage(
-              'Rebase continued but more conflicts were encountered. Resolve and continue.'
-            );
-          } else {
-            vscode.window.showInformationMessage('Rebase completed successfully.');
-            refreshTree();
-          }
-        } else {
-          vscode.window.showErrorMessage(`Failed to continue rebase: ${result.error}`);
-        }
-        changesProvider.refresh();
+        const result = await gitService.rebaseContinue(target.path);
+        await reportRebaseStep(
+          result.ok || result.autostashConflicts ? result : { ok: false, error: `Failed to continue the rebase in "${target.name}": ${result.error}` },
+          target.path,
+          `Rebase of "${target.name}" completed successfully.`,
+          `Rebase of "${target.name}" continued but more conflicts were encountered. Resolve and continue.`
+        );
       }
     )
   );
@@ -1013,21 +1077,15 @@ export function registerChatCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(
       'agntree.rebaseAbort',
-      async () => {
-        const worktree = changesProvider.getActiveWorktree();
-        if (!worktree) {
-          vscode.window.showErrorMessage('No active worktree selected.');
-          return;
-        }
-
-        if (!(await gitService.isRebaseInProgress(worktree.path))) {
-          vscode.window.showInformationMessage('No rebase in progress.');
+      async (arg?: RebaseSectionItem | string) => {
+        const target = await rebaseTarget(arg);
+        if (!target) {
           return;
         }
 
         const confirm = await vscode.window.showWarningMessage(
-          'Abort the current rebase? This will restore the branch to its original state.',
-          { modal: true },
+          `Abort the rebase in "${target.name}"? This will restore the branch to its original state.`,
+          { modal: true, detail: target.path },
           'Abort Rebase'
         );
 
@@ -1035,12 +1093,12 @@ export function registerChatCommands(
           return;
         }
 
-        const result = await gitService.rebaseAbort(worktree.path);
+        const result = await gitService.rebaseAbort(target.path);
         if (result.ok) {
-          vscode.window.showInformationMessage('Rebase aborted.');
+          vscode.window.showInformationMessage(`Rebase of "${target.name}" aborted.`);
           refreshTree();
         } else {
-          vscode.window.showErrorMessage(`Failed to abort rebase: ${result.error}`);
+          vscode.window.showErrorMessage(`Failed to abort the rebase in "${target.name}": ${result.error}`);
         }
         changesProvider.refresh();
       }
@@ -1051,32 +1109,29 @@ export function registerChatCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(
       'agntree.rebaseSkip',
-      async () => {
-        const worktree = changesProvider.getActiveWorktree();
-        if (!worktree) {
-          vscode.window.showErrorMessage('No active worktree selected.');
+      async (arg?: RebaseSectionItem | string) => {
+        const target = await rebaseTarget(arg);
+        if (!target) {
           return;
         }
 
-        if (!(await gitService.isRebaseInProgress(worktree.path))) {
-          vscode.window.showInformationMessage('No rebase in progress.');
+        // Skipping drops the commit being replayed from the rebased branch.
+        const confirm = await vscode.window.showWarningMessage(
+          `Skip the commit being replayed in "${target.name}"?`,
+          { modal: true, detail: `${target.path}\n\nIts changes are left out of the rebased branch.` },
+          'Skip Commit'
+        );
+        if (confirm !== 'Skip Commit') {
           return;
         }
 
-        const result = await gitService.rebaseSkip(worktree.path);
-        if (result.ok) {
-          if (await gitService.isRebaseInProgress(worktree.path)) {
-            vscode.window.showWarningMessage(
-              'Commit skipped but rebase is still in progress.'
-            );
-          } else {
-            vscode.window.showInformationMessage('Rebase completed after skipping.');
-            refreshTree();
-          }
-        } else {
-          vscode.window.showErrorMessage(`Failed to skip: ${result.error}`);
-        }
-        changesProvider.refresh();
+        const result = await gitService.rebaseSkip(target.path);
+        await reportRebaseStep(
+          result.ok || result.autostashConflicts ? result : { ok: false, error: `Failed to skip in "${target.name}": ${result.error}` },
+          target.path,
+          `Rebase of "${target.name}" completed after skipping.`,
+          `Commit skipped, but the rebase of "${target.name}" is still in progress.`
+        );
       }
     )
   );

@@ -97,6 +97,57 @@ describe('listWorktrees', () => {
   });
 });
 
+describe('removeWorktree', () => {
+  function setup(name: string) {
+    const dir = scratch(name);
+    const repo = initRepo(path.join(dir, 'repo'));
+    const worktree = path.join(dir, 'repo-worktrees', 'feature');
+    git(repo, 'worktree', 'add', '-q', '-b', 'feature', worktree);
+    writeFile(worktree, 'uncommitted.txt', 'work in progress\n');
+    return { repo, worktree };
+  }
+
+  it("leaves the folder alone when its .git is a repository of its own", async () => {
+    const { repo, worktree } = setup('remove-nested-repo');
+    // Something replaced the worktree's .git file with a separate repository that has its own history.
+    fs.rmSync(path.join(worktree, '.git'));
+    git(worktree, 'init', '-q', '-b', 'other');
+    git(worktree, 'add', '-A');
+    git(worktree, 'commit', '-q', '-m', 'only copy of this work');
+
+    for (const force of [false, true]) {
+      const result = await gitService.removeWorktree(repo, worktree, force);
+      assert.equal(result.ok, false);
+      assert.match(!result.ok ? result.error : '', /Nothing was deleted/);
+    }
+    assert.equal(fs.readFileSync(path.join(worktree, 'uncommitted.txt'), 'utf-8'), 'work in progress\n');
+    assert.equal(git(worktree, 'log', '-1', '--format=%s').trim(), 'only copy of this work');
+  });
+
+  it("leaves the folder alone when its .git file is missing", async () => {
+    const { repo, worktree } = setup('remove-missing-gitfile');
+    fs.rmSync(path.join(worktree, '.git'));
+    const result = await gitService.removeWorktree(repo, worktree);
+    assert.equal(result.ok, false);
+    assert.ok(fs.existsSync(path.join(worktree, 'uncommitted.txt')));
+  });
+
+  it('prunes a worktree whose folder is already gone', async () => {
+    const { repo, worktree } = setup('remove-gone');
+    removeDir(worktree);
+    assert.deepEqual(await gitService.removeWorktree(repo, worktree), { ok: true });
+    assert.equal((await gitService.listWorktrees(repo, 'r')).length, 1);
+  });
+
+  it('still refuses a dirty worktree without force, and removes it with force', async () => {
+    const { repo, worktree } = setup('remove-dirty');
+    assert.equal((await gitService.removeWorktree(repo, worktree)).ok, false);
+    assert.ok(fs.existsSync(worktree));
+    assert.deepEqual(await gitService.removeWorktree(repo, worktree, true), { ok: true });
+    assert.ok(!fs.existsSync(worktree));
+  });
+});
+
 describe('deleteBranch', () => {
   it('refuses to delete a branch with unmerged commits unless forced', async () => {
     const repo = initRepo(path.join(scratch('delete-unmerged'), 'repo'));

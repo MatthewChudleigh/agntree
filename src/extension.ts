@@ -13,6 +13,7 @@ import { registerChatCommands } from './commands/chat';
 import { registerQuickActionCommands } from './commands/quickActions';
 import { registerFileCommands } from './commands/files';
 import { samePath } from './utils/paths';
+import { pullRequestNumberForWorktree } from './utils/github';
 
 /**
  * Extension activation
@@ -110,7 +111,10 @@ export function activate(context: vscode.ExtensionContext) {
     sessionWatcher,
     refreshTree
   );
-  registerQuickActionCommands(context, changesProvider, quickActionsProvider);
+  registerQuickActionCommands(context, changesProvider, quickActionsProvider, async (worktreePath) => {
+    const worktree = await workspacesProvider.findWorktreeByPath(worktreePath);
+    return worktree ? pullRequestNumberForWorktree(worktree.branch, storageService.getPRWorktree(worktree.id)) : undefined;
+  });
   registerFileCommands(context, filesProvider);
 
   // Auto-switch workspace setting commands
@@ -152,6 +156,9 @@ export function activate(context: vscode.ExtensionContext) {
       refreshTree();
     })
   );
+
+  // Another window on this machine added, renamed or removed something
+  context.subscriptions.push(storageService.onDidChangeExternally(() => workspacesProvider.refresh({ pullRequests: false })));
 
   // Refresh quick actions view when settings change
   context.subscriptions.push(
@@ -296,6 +303,7 @@ export function activate(context: vscode.ExtensionContext) {
       workspacesProvider.dispose();
       quickActionsProvider.dispose();
       sessionWatcher.dispose();
+      storageService.dispose();
     },
   });
 

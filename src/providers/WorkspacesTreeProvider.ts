@@ -7,6 +7,7 @@ import { GitHubService } from '../services/GitHubService';
 import { TerminalManager } from '../services/TerminalManager';
 import { ClaudeSessionService } from '../services/ClaudeSessionService';
 import { samePath } from '../utils/paths';
+import { remoteOwners } from '../utils/github';
 
 /**
  * Tree item representing a node in the workspaces tree
@@ -45,6 +46,9 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
   /** Map of worktree ID to PR URL for context menu */
   private worktreePRUrls = new Map<string, string>();
 
+  /** Whether the pending refresh should fetch PRs again */
+  private refreshPullRequests = false;
+
   /** File watchers for git HEAD changes (branch switches) - one per repository */
   private headWatchers: vscode.FileSystemWatcher[] = [];
 
@@ -59,9 +63,6 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
 
   /** Tracks which repos have active HEAD watchers to avoid unnecessary recreation */
   private watchedRepoIds = '';
-
-  /** Generation counter to discard stale PR background fetches */
-  private prFetchGeneration = 0;
 
   /** Timer for periodic PR status refresh (every 5 minutes) */
   private prRefreshInterval: NodeJS.Timeout | undefined;
@@ -159,8 +160,11 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
 
   /**
    * Refresh the tree view (debounced — multiple rapid calls coalesce into one)
+   * @param options.pullRequests false to keep the cached PRs, e.g. when only saved
+   *   sessions changed (another window saves on every terminal open and close)
    */
-  refresh(): void {
+  refresh(options: { pullRequests?: boolean } = {}): void {
+    this.refreshPullRequests ||= options.pullRequests !== false;
     if (this.refreshDebounceTimer) {
       clearTimeout(this.refreshDebounceTimer);
     }
@@ -172,8 +176,11 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
 
   private doRefresh(): void {
     this.worktreeCache.clear();
-    this.gitHubService.clearCache();
-    this.worktreePRUrls.clear();
+    if (this.refreshPullRequests) {
+      this.gitHubService.clearCache();
+      this.worktreePRUrls.clear();
+      this.refreshPullRequests = false;
+    }
     this.updateHeadWatchersIfNeeded();
     this._onDidChangeTreeData.fire(undefined);
   }
@@ -303,8 +310,11 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
     // Get current workspace folder to highlight active worktree
     const currentFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
-    // Collect uncached branches for background fetch
-    const uncachedBranches: string[] = [];
+    // The repository's PRs, fetched in the background the first time (badges appear when it finishes)
+    const pullRequests = this.gitHubService.getCachedPullRequests(repo.rootPath);
+    if (!pullRequests) {
+      this.fetchPullRequestsInBackground(repo.rootPath);
+    }
 
     const items = worktrees.map((worktree) => {
       const isCurrentWorkspace = !!currentFolder && samePath(currentFolder, worktree.path);
@@ -350,29 +360,26 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
         descParts.push('● active workspace');
       }
 
+      // A worktree made by Checkout PR is matched by its PR number (its branch is pr-<n>);
+      // others by branch name. Detached worktrees have no branch to look a PR up by.
+      const prInfo = prWorktreeNumber
+        ? pullRequests?.byNumber.get(prWorktreeNumber)
+        : worktree.branch
+          ? pullRequests?.byBranch.get(worktree.branch)
+          : undefined;
+
       if (prWorktreeNumber) {
-        descParts.push(`PR #${prWorktreeNumber}`);
+        descParts.push(prInfo ? `PR ${this.gitHubService.formatPRDescription(prInfo)}` : `PR #${prWorktreeNumber}`);
+      } else if (prInfo) {
+        descParts.push(this.gitHubService.formatPRDescription(prInfo));
       }
 
-      // Get cached PR info (may be undefined if not fetched yet). Detached worktrees
-      // have no branch, so there's nothing to look a PR up by.
-      const prInfo = worktree.branch ? this.gitHubService.getCachedPRInfo(repo.rootPath, worktree.branch) : null;
-
-      if (prInfo === undefined && worktree.branch) {
-        // Not cached yet, queue for background fetch
-        uncachedBranches.push(worktree.branch);
-      } else if (prInfo) {
-        // Only add PR description if not already shown via PR worktree marker
-        if (!prWorktreeNumber) {
-          const prDesc = this.gitHubService.formatPRDescription(prInfo);
-          if (prDesc) {
-            descParts.push(prDesc);
-          }
-        }
+      if (prInfo) {
         // Store PR URL in Map for context menu
         this.worktreePRUrls.set(worktree.id, prInfo.url);
         // Build tooltip with PR title
-        item.tooltip = `${worktree.path}\n\nPR #${prInfo.number}: ${prInfo.title}`;
+        const state = prInfo.isDraft ? 'draft' : prInfo.state;
+        item.tooltip = `${worktree.path}\n\nPR #${prInfo.number} (${state}): ${prInfo.title}`;
       }
 
       if (descParts.length > 0) {
@@ -387,34 +394,26 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
       return item;
     });
 
-    // Start background fetch for uncached branches
-    if (uncachedBranches.length > 0) {
-      this.fetchPRInfoInBackground(repo.rootPath, uncachedBranches);
-    }
-
     return items;
   }
 
   /**
-   * Fetch PR info for branches in background, then refresh tree
+   * Fetch a repository's PRs in the background, then redraw so the badges appear. If the
+   * cache was cleared meanwhile, the redraw that cleared it has already asked again.
    */
-  private fetchPRInfoInBackground(repoPath: string, branches: string[]): void {
-    const generation = ++this.prFetchGeneration;
-
-    Promise.all(
-      branches.map((branch) => this.gitHubService.fetchPRInfo(repoPath, branch))
-    )
-      .then(() => {
-        if (generation === this.prFetchGeneration) {
-          this._onDidChangeTreeData.fire(undefined);
-        }
-      })
-      .catch((error) => {
-        console.error('Failed to fetch PR info in background:', error);
-        if (generation === this.prFetchGeneration) {
-          this._onDidChangeTreeData.fire(undefined);
-        }
-      });
+  private fetchPullRequestsInBackground(repoPath: string): void {
+    // GitHubService runs one fetch per repository at a time, so repeated calls are cheap.
+    this.gitService
+      .listRemoteUrls(repoPath)
+      .then((remotes) => this.gitHubService.fetchPullRequests(repoPath, remoteOwners(remotes)))
+      .then(
+        (result) => {
+          if (this.gitHubService.getCachedPullRequests(repoPath) === result) {
+            this._onDidChangeTreeData.fire(undefined);
+          }
+        },
+        (error) => console.error('Failed to fetch PR info in background:', error)
+      );
   }
 
   /**

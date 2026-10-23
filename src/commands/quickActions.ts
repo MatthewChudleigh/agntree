@@ -1,18 +1,45 @@
 import * as vscode from 'vscode';
 import { ChangesTreeProvider } from '../providers/ChangesTreeProvider';
 import { QuickAction, QuickActionsTreeProvider } from '../providers/QuickActionsTreeProvider';
+import { ProcessSpec, spawnProcessTree } from '../utils/processes';
 
 /**
  * Register quick action related commands
+ * @param getPullRequestNumber - the PR a worktree was checked out from, if any
  */
 export function registerQuickActionCommands(
   context: vscode.ExtensionContext,
   changesProvider: ChangesTreeProvider,
-  quickActionsProvider: QuickActionsTreeProvider
+  quickActionsProvider: QuickActionsTreeProvider,
+  getPullRequestNumber: (worktreePath: string) => Promise<number | undefined>
 ): void {
   // Create output channel for Quick Actions
   const quickActionsOutput = vscode.window.createOutputChannel('Agntree Quick Actions');
   context.subscriptions.push(quickActionsOutput);
+
+  /**
+   * `claude -p` shows no workspace trust prompt and runs the hooks and MCP servers in the
+   * folder's own `.claude/settings.json` and `.mcp.json`. In a worktree checked out from a
+   * PR those files come from the PR's author, so ask first.
+   */
+  async function confirmClaudeInPullRequest(action: QuickAction, worktreePath: string): Promise<boolean> {
+    const prNumber = await getPullRequestNumber(worktreePath);
+    if (prNumber === undefined) {
+      return true;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      `Run "${action.name}" in the worktree for PR #${prNumber}?`,
+      {
+        modal: true,
+        detail:
+          'This quick action runs Claude Code headlessly (claude -p). In that mode Claude Code shows no trust prompt ' +
+          "and runs the hooks and MCP servers defined in the PR's .claude/settings.json and .mcp.json, so code written " +
+          "by the PR's author can run on this machine. Only continue if you trust this PR.",
+      },
+      'Run Anyway'
+    );
+    return choice === 'Run Anyway';
+  }
 
   // Helper function to run a quick action
   async function executeQuickAction(action: QuickAction, index: number, worktreePath: string): Promise<void> {
@@ -30,101 +57,74 @@ export function registerQuickActionCommands(
       return;
     }
 
+    if (!action.command && !(await confirmClaudeInPullRequest(action, worktreePath))) {
+      return;
+    }
+    if (quickActionsProvider.isActionRunning(index)) {
+      return; // started again while the confirmation was open
+    }
+
     // Log start to output channel
     const timestamp = new Date().toLocaleTimeString();
     quickActionsOutput.appendLine(`\n[${timestamp}] Running: ${action.name}`);
     quickActionsOutput.appendLine('─'.repeat(50));
 
-    const { spawn } = await import('child_process');
-
-    let childProcess;
-
+    let spec: ProcessSpec;
     if (action.command) {
       // Command mode: run raw shell command (cross-platform)
       quickActionsOutput.appendLine(`$ ${action.command}\n`);
-      childProcess = spawn(action.command, {
-        cwd: worktreePath,
-        shell: true, // Uses default shell on each platform
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      spec = { command: action.command };
     } else {
       // Claude mode: run claude with prompt and allowedTools
       quickActionsOutput.appendLine(`$ claude -p "${action.prompt}" --allowedTools "${action.allowedTools}"\n`);
-      childProcess = spawn('claude', ['-p', action.prompt!, '--allowedTools', action.allowedTools!], {
-        cwd: worktreePath,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      spec = { file: 'claude', args: ['-p', action.prompt!, '--allowedTools', action.allowedTools!] };
     }
 
-    // Register process as running
+    const childProcess = spawnProcessTree(spec, worktreePath);
     quickActionsProvider.setActionRunning(index, childProcess);
 
-    let stdout = '';
-    let stderr = '';
+    // Show output as it arrives (setEncoding keeps multi-byte characters split across chunks intact).
+    for (const stream of [childProcess.stdout, childProcess.stderr]) {
+      stream?.setEncoding('utf8');
+      stream?.on('data', (text: string) => quickActionsOutput.append(text));
+    }
 
-    childProcess.stdout?.on('data', (data: Buffer) => {
-      stdout += data.toString();
-    });
+    let finished = false;
+    const finish = (line: string) => {
+      if (finished) {
+        return false;
+      }
+      finished = true;
+      quickActionsProvider.setActionStopped(index, childProcess);
+      quickActionsOutput.appendLine(`\n${line}`);
+      quickActionsOutput.appendLine('─'.repeat(50));
+      return true;
+    };
+    const offerOutput = (selection: string | undefined) => {
+      if (selection === 'Show Output') {
+        quickActionsOutput.show();
+      }
+    };
 
-    childProcess.stderr?.on('data', (data: Buffer) => {
-      stderr += data.toString();
-    });
-
-    childProcess.on('close', (code: number | null) => {
-      // Mark as stopped
-      quickActionsProvider.setActionStopped(index);
-
+    childProcess.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
       if (code === 0) {
-        const output = stdout.trim() || `${action.name} completed successfully!`;
-
-        // Log to output channel
-        quickActionsOutput.appendLine(output);
-        quickActionsOutput.appendLine(`\n✓ ${action.name} completed`);
-        quickActionsOutput.appendLine('─'.repeat(50));
-
-        // Show notification with button to view output
-        vscode.window.showInformationMessage(
-          `${action.name} completed`,
-          'Show Output'
-        ).then(selection => {
-          if (selection === 'Show Output') {
-            quickActionsOutput.show();
-          }
-        });
-
-        changesProvider.refresh();
+        if (finish(`✓ ${action.name} completed`)) {
+          vscode.window.showInformationMessage(`${action.name} completed`, 'Show Output').then(offerOutput);
+          changesProvider.refresh();
+        }
       } else if (code === null) {
-        // Process was killed/terminated
-        quickActionsOutput.appendLine(`\n⊘ ${action.name} was stopped`);
-        quickActionsOutput.appendLine('─'.repeat(50));
-
-        vscode.window.showInformationMessage(`${action.name} stopped`);
-      } else {
-        const errorMessage = stderr || stdout || 'Unknown error';
-
-        // Log error to output channel
-        quickActionsOutput.appendLine(`Error: ${errorMessage}`);
-        quickActionsOutput.appendLine(`\n✗ ${action.name} failed (exit code: ${code})`);
-        quickActionsOutput.appendLine('─'.repeat(50));
-
-        vscode.window.showErrorMessage(
-          `${action.name} failed`,
-          'Show Output'
-        ).then(selection => {
-          if (selection === 'Show Output') {
-            quickActionsOutput.show();
-          }
-        });
+        if (finish(`⊘ ${action.name} was stopped${signal ? ` (${signal})` : ''}`)) {
+          vscode.window.showInformationMessage(`${action.name} stopped`);
+        }
+      } else if (finish(`✗ ${action.name} failed (exit code: ${code})`)) {
+        vscode.window.showErrorMessage(`${action.name} failed`, 'Show Output').then(offerOutput);
       }
     });
 
     childProcess.on('error', (err: Error) => {
-      // Mark as stopped
-      quickActionsProvider.setActionStopped(index);
-
-      quickActionsOutput.appendLine(`Error: ${err.message}`);
-      quickActionsOutput.appendLine('─'.repeat(50));
-      vscode.window.showErrorMessage(`Failed to run command: ${err.message}`);
+      if (finish(`Error: ${err.message}`)) {
+        vscode.window.showErrorMessage(`Failed to run command: ${err.message}`);
+      }
     });
   }
 

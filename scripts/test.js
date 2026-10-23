@@ -14,9 +14,16 @@ const entryPoints = fs
   .filter((file) => file.endsWith('.test.ts'))
   .map((file) => path.join(testDir, file));
 
+// Scripts that tests run as separate processes; built to out-test/fixtures/.
+const fixtureDir = path.join(testDir, 'fixtures');
+const fixtures = fs.existsSync(fixtureDir)
+  ? fs.readdirSync(fixtureDir).filter((file) => file.endsWith('.ts')).map((file) => path.join(fixtureDir, file))
+  : [];
+
 fs.rmSync(outDir, { recursive: true, force: true });
 esbuild.buildSync({
-  entryPoints,
+  entryPoints: [...entryPoints, ...fixtures],
+  outbase: testDir,
   bundle: true,
   platform: 'node',
   format: 'cjs',

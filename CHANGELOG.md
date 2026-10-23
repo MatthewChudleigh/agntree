@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Saved data is now per machine** — Repositories and sessions were kept in VS Code's `globalState`, which lives on your local VS Code and is shared by every machine it connects to. Over Remote-SSH (including Coder), two workspaces with the same paths showed each other's sessions, and removing a "missing" session in one removed it from the other; windows could also overwrite each other's lists. They are now kept in a file on the machine itself (the extension's global storage folder; on a remote, under `~/.vscode-server`), which windows on that machine lock while saving so none of their changes are lost. On first start each machine copies over its own repositories and sessions — those whose folders and Claude Code logs exist there.
+
 ### Fixed
+
+- **Delete Worktree could delete a folder git refused to remove** — When git didn't recognize a worktree (for example its `.git` had been replaced by a repository of its own), the folder was deleted recursively, without checking for uncommitted changes. Now only git deletes worktrees; if it refuses, nothing is deleted and the reason is shown. A worktree whose folder is already gone is pruned.
+- **Search and Import Sessions read every session log on the machine** — Finding a repository's sessions parsed all of `~/.claude/projects` first (2 minutes for 3.3 GB of logs), and each preview re-scanned every project folder synchronously. Only the folders named after the repository's paths are read now, and previews read the file already found. Sessions started in a subfolder are now found on Windows too.
+- **Session names were often Claude Code's own text** — Names came from `summary` entries, which current Claude Code doesn't write, or from the first user message, which often starts with a `<system-reminder>` block or a slash-command wrapper. Names now come from Claude Code's session title (`custom-title`), else the first thing you typed (slash commands show as `/name args`). New sessions pick up the title once Claude Code records it. Previews skip system text and tool results.
+- **`CLAUDE_CONFIG_DIR` was ignored** — Sessions were always looked for in `~/.claude`, so with Claude Code's config folder moved elsewhere none were found.
+- **PR badges never showed merged or closed PRs** — `gh pr list` returns only open PRs unless asked, so a branch whose PR was merged looked like it had none, and a fork's PR could be shown on a local branch that happened to share its name (such as `main`). PRs in every state now show, from two `gh` calls per repository (all open PRs, and the newest 200 in any state) instead of one per worktree. Fork PRs match a branch only when the fork is yours (its owner owns one of the repository's remotes), and worktrees made by Checkout PR now show their PR's state and can open it in the browser.
+- **All Files → Delete always failed over Remote-SSH** — It asked VS Code for the trash, which remote windows don't have. In a remote window it now asks to delete permanently; locally it offers that if the trash fails. Reveal in Finder is hidden in remote windows, where it did nothing.
+- **Stopping a quick action left its processes running** — On Linux and macOS, Stop signalled only the shell, so the commands it started (for `npm test && npm run lint`, npm and its children) kept running while the panel showed the action as stopped and allowed starting it again. Stop now ends the whole process tree, force-killing it after 5 seconds, and the action shows as running until it has finished (or 2 seconds after the force-kill at most). Output now appears in the output channel as it is produced instead of when the action ends.
 
 - **Delete Worktree & Branch could delete the wrong branch** — For a detached worktree (for example mid-rebase) the folder name was used as the branch name, so an unrelated branch with that name was force-deleted. Worktrees now track their real branch, detached ones offer no branch deletion, and a branch with unmerged commits is only deleted after a second confirmation that says how many commits would be lost.
 - **New File emptied existing files** — Typing an existing name into All Files → New File overwrote that file with nothing. New File, New Folder and Rename now refuse names that already exist or point outside the worktree, and say so as you type.
@@ -20,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Claude quick actions ask before running in a PR's worktree** — Claude-mode quick actions run `claude -p`, which shows no workspace trust prompt and runs the hooks and MCP servers in the folder's `.claude/settings.json` and `.mcp.json`. In a worktree made by Checkout PR those files come from the PR's author, so running the default "Commit" action there could run their code. Claude quick actions now ask for confirmation in those worktrees.
 - **Quick actions can only be defined in user settings** — `agntree.quickActions` runs shell commands and headless Claude prompts, but could be set by any repository's `.vscode/settings.json` (including a PR checked out from a fork). It is now `application`-scoped. Move any quick actions you defined in workspace settings to your user settings.
 
 ### Added

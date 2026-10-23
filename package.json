@@ -806,7 +806,7 @@
         },
         {
           "command": "agntree.files.revealInFinder",
-          "when": "view == agntree.filesView && (viewItem == file || viewItem == folder)",
+          "when": "view == agntree.filesView && (viewItem == file || viewItem == folder) && !remoteName",
           "group": "2_reveal@1"
         },
         {

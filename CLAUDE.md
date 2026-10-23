@@ -21,7 +21,7 @@ To test during development: Press F5 in VS Code to launch the Extension Developm
 
 Tests live in `src/test/*.test.ts` and use Node's built-in test runner (`node:test`). `scripts/test.js` bundles them with esbuild into `out-test/` and runs `node --test`, so there are no extra test dependencies.
 
-- Tests cover code that doesn't import `vscode`: `GitService` (against real temporary git repositories), `ClaudeSessionService` (against a fake `~/.claude`), and the helpers in `src/utils/`. Keep logic you want tested out of the command and provider files.
+- Tests cover code that doesn't import `vscode`: `GitService` (against real temporary git repositories), `ClaudeSessionService` (against a fake `~/.claude`), `StateStore`, and the helpers in `src/utils/`. Keep logic you want tested out of the command and provider files.
 - `src/test/helpers.ts` isolates git from your own config (`GIT_CONFIG_GLOBAL`, no system config), so signing, hooks or `autocrlf` can't change results.
 - Known bugs that aren't fixed yet are written as `{ todo: '...' }` tests: they run and report but don't fail the suite, and start passing when the bug is fixed.
 - Pass extra flags through to `node --test`, e.g. `node scripts/test.js --test-name-pattern=rename`.
@@ -32,14 +32,14 @@ This is a VS Code extension that manages Claude Code CLI sessions across git rep
 
 ### Core Services (`src/services/`)
 
-- **StorageService** - Persists repositories and sessions to VS Code's globalState
+- **StorageService** - Persists repositories and sessions for this machine in `state.json` under `context.globalStorageUri`, through `StateStore`. Each change takes a lock file, re-reads the file and replaces it with a rename, so windows saving at once don't lose changes; a read error throws rather than saving an empty state over the file. Don't use `globalState` for this: it is stored on the VS Code client and shared by every remote, so Coder workspaces with the same paths saw each other's sessions. It was migrated once per machine, keeping only repositories and sessions that exist there.
 - **GitService** - Git operations: worktree listing/creation/deletion, branch merging, working tree status, rebase, and fetching PRs. Every call is async, uses `execFile` with an argument array (never a shell), and has a timeout. Never add a synchronous git call: in a Remote-SSH window the extension host also runs the Git extension and language servers, and blocking it freezes them all.
 - **TerminalManager** - Spawns and manages VS Code terminals running `claude` CLI
 - **ClaudeSessionService** - Discovers existing Claude Code sessions from `~/.claude/projects/`, copies sessions between worktrees for forking, repository-wide session search via `findSessionsForRepository()`
 
 ### Tree Providers (`src/providers/`)
 
-- **WorkspacesTreeProvider** - Main sidebar tree: Repository → Worktree → Session hierarchy
+- **WorkspacesTreeProvider** - Main sidebar tree: Repository → Worktree → Session hierarchy. PR badges come from `GitHubService.fetchPullRequests`: two `gh pr list` calls per repository (all open PRs, plus the newest 200 in any state), matched by branch name. Fork PRs match by branch only when the fork's owner owns one of the repository's remotes; otherwise only worktrees made by Checkout PR match them, by number
 - **ChangesTreeProvider** - Shows staged/unstaged git changes for the active worktree
 - **QuickActionsTreeProvider** - Quick actions panel with process tracking for run/stop functionality
 
@@ -53,7 +53,7 @@ Commands are registered in `package.json` under `contributes.commands` and imple
 
 ### Data Flow
 
-1. User adds a repository → stored in globalState
+1. User adds a repository → stored in this machine's state file
 2. GitService detects worktrees via `git worktree list --porcelain`
 3. User creates a session → TerminalManager spawns terminal with `claude --resume <sessionId>`
 4. Sessions link to Claude Code's session files for resumption
@@ -66,7 +66,10 @@ Commands are registered in `package.json` under `contributes.commands` and imple
 
 ## Claude Code Session Discovery
 
-Sessions are stored in `~/.claude/projects/<encoded-path>/*.jsonl`. The `ClaudeSessionService` parses these files to extract session IDs, summaries, and timestamps for import into the extension.
+Sessions are stored in `~/.claude/projects/<encoded-path>/*.jsonl` (`$CLAUDE_CONFIG_DIR/projects/` when that is set; see `claudeConfigDir()`). The `ClaudeSessionService` parses these files to extract session IDs, summaries, and timestamps for import into the extension.
+
+- Names come from `custom-title` entries (older logs: `summary`), else the first prompt the user typed. Claude Code puts its own text in user messages, wrapped in tags such as `<system-reminder>` or `<command-name>`, and marks some entries `isMeta`. `src/utils/sessionLog.ts` removes these, and both `ClaudeSessionService` and `SessionWatcher` use it.
+- Searches read only the project folders whose name starts with an encoded repository or worktree path. A machine can hold gigabytes of logs, and reading them all took minutes.
 
 ### Path Encoding
 
@@ -97,11 +100,13 @@ Quick Actions allow running Claude prompts or shell commands with one click from
 
 The `agntree.quickActions` setting is `"scope": "application"`, so it can only be set in user settings. Keep it that way: both modes run arbitrary commands, and a workspace-scoped setting would let any repository's `.vscode/settings.json` (including a PR checked out from a fork) redefine them.
 
+Claude mode asks before running in a worktree made by Checkout PR (a recorded PR or a `pr-<n>` branch). `claude -p` shows no workspace trust prompt. It runs the hooks and MCP servers in the folder's `.claude/settings.json` and `.mcp.json`, and in a PR worktree those files come from the PR's author.
+
 ### Process Management
 
 The `QuickActionsTreeProvider` tracks running processes in a `Map<number, ChildProcess>`. This enables:
 - Displaying a spinning sync icon for running actions
-- Stop button to terminate running processes via `process.kill()`
+- A Stop button that ends the whole process tree. `spawnProcessTree` (`src/utils/processes.ts`) starts each action in its own process group, and `killProcessTree` signals the group (`taskkill /T` on Windows). Signalling only the shell leaves `a && b`'s children running. `stopProcessTree` sends SIGKILL after 5 seconds if the action's output hasn't closed. It shows the action as stopped 2 seconds after that, even if something outside the group still holds the output open. The action shows as running until then.
 - Preventing duplicate runs of the same action
 
 ### Dynamic View Titles
@@ -171,7 +176,7 @@ The `agntree.searchSessions` command finds all Claude Code sessions related to a
 
 Calling `vscode.workspace.updateWorkspaceFolders()` to switch to a different repository **terminates and restarts the extension host**. All in-memory state is lost. To persist state across these restarts:
 
-1. Save critical state to `globalState` before the switch (e.g., `storageService.setActiveWorktreeId()`)
+1. Save anything that must survive to `StorageService` before the switch. The active worktree and chat are per window and not saved; `activate()` finds the active worktree again from the workspace folder.
 2. Restore state in `activate()` after restart
 3. Don't rely on in-memory maps/caches surviving
 

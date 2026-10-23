@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { GitError, GitRunOptions, GitService, describeGitError } from '../services/GitService';
 import { samePath } from '../utils/paths';
+import { repositoriesForFolders } from '../utils/workspaceRepos';
 import { commitFile, git, initRepo, makeTempDir, removeDir, slowCommand, writeFile } from './helpers';
 
 /** GitService that records the git commands it runs and exposes run() to tests. */
@@ -475,13 +476,6 @@ describe('known bugs (todo)', () => {
     assert.equal(git(repo, 'ls-files', '-s', '.claude').trim(), '');
   });
 
-  it('getRepoRoot returns the main repository when called from a linked worktree', { todo: 'Add Repository from inside a Claude worktree records the worktree as the repository' }, async () => {
-    const repo = initRepo(path.join(scratch('todo-repo-root'), 'repo'));
-    const nested = path.join(repo, '.claude', 'worktrees', 'x');
-    git(repo, 'worktree', 'add', '-q', '-b', 'claude/x', nested);
-    const root = await gitService.getRepoRoot(nested);
-    assert.ok(root && samePath(root, repo));
-  });
 });
 
 describe('createWorktree from a remote branch', () => {
@@ -635,5 +629,37 @@ describe('file paths that look like globs', () => {
     git(repo, 'add', '-A');
     assert.deepEqual(await gitService.unstageFiles(repo, ['app/[id]/page.tsx']), { ok: true });
     assert.deepEqual(git(repo, 'diff', '--cached', '--name-only').trim().split('\n').sort(), ['app/d/page.tsx', 'app/i/page.tsx']);
+  });
+});
+
+describe('the repository of a folder', () => {
+  it('is the main checkout, also from a subfolder or a Claude worktree inside it', async () => {
+    const repo = initRepo(path.join(scratch('repo-root'), 'repo'), { 'src/index.ts': 'x\n' });
+    const nested = path.join(repo, '.claude', 'worktrees', 'x');
+    git(repo, 'worktree', 'add', '-q', '-b', 'claude/x', nested);
+    for (const dir of [repo, path.join(repo, 'src'), nested, path.join(nested, 'src')]) {
+      const root = await gitService.getRepoRoot(dir);
+      assert.ok(root && samePath(root, repo), `${dir} gave ${root}`);
+    }
+  });
+
+  it('is null outside git', async () => {
+    assert.equal(await gitService.getRepoRoot(scratch('not-a-repo')), null);
+  });
+
+  it('is added once for the folders open in a window, and not again once known', async () => {
+    const dir = scratch('workspace-folders');
+    const repo = initRepo(path.join(dir, 'repo'));
+    const nested = path.join(repo, '.claude', 'worktrees', 'x');
+    git(repo, 'worktree', 'add', '-q', '-b', 'claude/x', nested);
+    const other = initRepo(path.join(dir, 'other'));
+    const plain = path.join(dir, 'plain');
+    fs.mkdirSync(plain);
+    const getRoot = (folder: string) => gitService.getRepoRoot(folder);
+
+    const roots = await repositoriesForFolders([nested, repo, plain, other], [], getRoot);
+    assert.deepEqual(roots.map((root) => samePath(root, repo) || samePath(root, other)), [true, true]);
+    assert.ok(samePath(roots[0], repo));
+    assert.deepEqual(await repositoriesForFolders([nested, other], roots, getRoot), []);
   });
 });

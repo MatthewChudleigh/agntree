@@ -66,3 +66,11 @@ describe('package.json', () => {
     assert.deepEqual(unregistered, []);
   });
 });
+
+describe('extension identity', () => {
+  it("uses this fork's own ID, not the Marketplace extension it was forked from", () => {
+    // With the same ID, VS Code installs and updates the Marketplace extension in its place
+    // ("Install in SSH", remote.SSH.defaultExtensions, auto-update).
+    assert.notEqual(`${pkg.publisher}.${pkg.name}`, 'subhashkhileri.agntree');
+  });
+});

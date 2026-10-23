@@ -1,10 +1,11 @@
-# Agntree — Claude Code Session & Worktree Manager for VS Code & Cursor
+# Agntree for Devboxes
 
-[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/subhashkhileri.agntree?label=VS%20Code%20Marketplace&logo=visual-studio-code&color=blue)](https://marketplace.visualstudio.com/items?itemName=subhashkhileri.agntree)
-[![Installs](https://img.shields.io/visual-studio-marketplace/i/subhashkhileri.agntree?label=Installs&color=green)](https://marketplace.visualstudio.com/items?itemName=subhashkhileri.agntree)
-[![Rating](https://img.shields.io/visual-studio-marketplace/r/subhashkhileri.agntree?label=Rating)](https://marketplace.visualstudio.com/items?itemName=subhashkhileri.agntree)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub stars](https://img.shields.io/github/stars/subhashkhileri/agntree?style=social)](https://github.com/subhashkhileri/agntree)
+
+> **This is a fork** of [Agntree](https://github.com/subhashkhileri/agntree) by Subhash Khileri, for Coder devboxes reached with VS Code over Remote-SSH.
+> Its extension ID is `fullhousevenues.agntree`, so it doesn't clash with the Marketplace extension `subhashkhileri.agntree`; uninstall that one first.
+> It isn't on the Marketplace. Devboxes install it from the internal GitLab package registry at each start: see [devbox/README.md](devbox/README.md).
+> The rest of this README is upstream's, and the Marketplace links in it go to upstream.
 
 > **The missing session manager for Claude Code.** Resume, fork, search, and organize your Claude Code CLI sessions across git worktrees — all from a single VS Code sidebar.
 > Works with VS Code & Cursor. Extensible architecture — contributions for Copilot, Cline, Aider, and more are welcome.

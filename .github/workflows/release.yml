@@ -34,26 +34,20 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
-      - name: Publish to VS Code Marketplace
-        run: npx @vscode/vsce publish
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
-
+      # This fork isn't on the Marketplace: devboxes get it from the internal GitLab's package
+      # registry (.gitlab-ci.yml, devbox/README.md). The GitHub release only holds the VSIX.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: '*.vsix'
           generate_release_notes: true
           body: |
-            ## Agntree v${{ steps.version.outputs.VERSION }}
+            ## Agntree for Devboxes v${{ steps.version.outputs.VERSION }}
 
-            AI coding agent session manager for VS Code & Cursor.
-            Manage Claude Code sessions across git repositories and worktrees.
+            A fork of [Agntree](https://github.com/subhashkhileri/agntree) for Coder devboxes over Remote-SSH,
+            with the extension ID `fullhousevenues.agntree`. Uninstall the Marketplace Agntree first.
 
             ### Installation
-            **VS Code Marketplace:** [Install Agntree](https://marketplace.visualstudio.com/items?itemName=subhashkhileri.agntree)
-
-            **Manual Install:**
             1. Download the `.vsix` file below
             2. In VS Code, run `Extensions: Install from VSIX...` from the command palette
             3. Select the downloaded file

@@ -17,3 +17,5 @@ CLAUDE.md
 .claude/**
 out-test/**
 scripts/**
+.gitlab-ci.yml
+devbox/**

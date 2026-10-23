@@ -13,7 +13,9 @@ import { registerWorktreeCommands } from './commands/worktree';
 import { registerChatCommands } from './commands/chat';
 import { registerQuickActionCommands } from './commands/quickActions';
 import { registerFileCommands } from './commands/files';
+import * as path from 'path';
 import { samePath } from './utils/paths';
+import { repositoriesForFolders } from './utils/workspaceRepos';
 import { pullRequestNumberForWorktree } from './utils/github';
 
 /**
@@ -173,11 +175,34 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // Add the repositories of the open folders (on a devbox, the checkout in ~/work/<repo>, on a
+  // machine that is new at every start), unless turned off.
+  const addWorkspaceRepositories = async (): Promise<void> => {
+    if (!vscode.workspace.getConfiguration('agntree').get<boolean>('autoAddWorkspaceRepositories', true)) {
+      return;
+    }
+    const folders = (vscode.workspace.workspaceFolders ?? [])
+      .filter((folder) => folder.uri.scheme === 'file')
+      .map((folder) => folder.uri.fsPath);
+    const known = storageService.getRepositories(true).map((repo) => repo.rootPath);
+    const roots = await repositoriesForFolders(folders, known, (dir) => gitService.getRepoRoot(dir));
+    for (const root of roots) {
+      storageService.addRepository(path.basename(root), root);
+    }
+    if (roots.length > 0) {
+      refreshTree();
+    }
+  };
+  const addWorkspaceRepositoriesSafely = () =>
+    addWorkspaceRepositories().catch((error) => console.error('Failed to add the workspace folder repositories:', error));
+  context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => addWorkspaceRepositoriesSafely()));
+
   // On activation, expand only the worktree matching the current VS Code workspace folder.
   // Runs in the background so git never delays activation.
   const currentFolderPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  const workspaceRepositoriesAdded = addWorkspaceRepositoriesSafely();
   if (currentFolderPath) {
-    workspacesProvider.findWorktreeByPath(currentFolderPath).then((activeWorktree) => {
+    workspaceRepositoriesAdded.then(() => workspacesProvider.findWorktreeByPath(currentFolderPath)).then((activeWorktree) => {
       if (!activeWorktree) {
         return;
       }

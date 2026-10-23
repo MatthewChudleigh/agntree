@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { Repository, ChatSession, STORAGE_KEYS, generateId } from '../types';
 import { ClaudeSessionService } from './ClaudeSessionService';
-import { LegacyState, PersistedState, StateStore, migrateLegacyState } from './StateStore';
+import { LegacyState, PersistedState, StateStore, adoptStateFile, migrateLegacyState } from './StateStore';
 
 /**
  * Saves repositories and sessions for this machine.
@@ -28,7 +28,7 @@ export class StorageService implements vscode.Disposable {
 
   constructor(private context: vscode.ExtensionContext) {
     this.store = new StateStore(path.join(context.globalStorageUri.fsPath, 'state.json'));
-    if (!this.store.exists()) {
+    if (!this.store.exists() && !this.adoptRenamedExtensionState()) {
       this.migrateFromGlobalState();
     }
     try {
@@ -42,6 +42,23 @@ export class StorageService implements vscode.Disposable {
     this.watcher?.dispose();
     this._onDidChangeExternally.dispose();
   }
+
+  /**
+   * One-time copy of the state file saved under the extension's old ID. Storage folders are
+   * named after the ID (`globalStorage/<publisher>.<name>`), and so is globalState.
+   */
+  private adoptRenamedExtensionState(): boolean {
+    const legacy = path.join(path.dirname(this.context.globalStorageUri.fsPath), StorageService.PREVIOUS_ID, 'state.json');
+    try {
+      return adoptStateFile(legacy, this.store);
+    } catch (error) {
+      console.error('Failed to copy the state saved under the old extension ID:', error);
+      return false;
+    }
+  }
+
+  /** The ID this extension had before the fork was renamed. */
+  private static readonly PREVIOUS_ID = 'subhashkhileri.agntree';
 
   /** One-time copy of what older versions saved in globalState, keeping only this machine's data. */
   private migrateFromGlobalState(): void {

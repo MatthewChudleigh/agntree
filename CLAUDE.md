@@ -11,11 +11,21 @@ npm run watch                    # Build with auto-rebuild on changes
 npm run typecheck                # Type-check (esbuild alone does not)
 npm test                         # Type-check, then run the unit tests
 npm run lint                     # Run ESLint
-npx @vscode/vsce package         # Package as .vsix for installation
+npx vsce package                 # Package as .vsix (vsce is a pinned dev dependency)
 code --install-extension *.vsix  # Install the packaged extension
 ```
 
 To test during development: Press F5 in VS Code to launch the Extension Development Host.
+
+## This fork and its distribution
+
+This is **Agntree for Devboxes**, a fork of github.com/subhashkhileri/agntree for Coder devboxes over Remote-SSH (see `devbox/README.md`).
+
+- The extension ID is `fullhousevenues.agntree`. Never change `publisher` or `name` back to upstream's `subhashkhileri.agntree`: that ID is on the Marketplace, and VS Code would install and update the Marketplace extension in place of the fork. `manifest.test.ts` checks this.
+- VS Code names the storage folder after the ID (`globalStorage/<publisher>.<name>`). `StorageService` copies `state.json` from the previous ID's folder on first start (`adoptStateFile`). A future rename needs the same.
+- `.gitlab-ci.yml` runs on the internal GitLab's `venues` runners. Every pipeline builds and tests; a `v<version>` tag publishes `agntree/<version>/agntree-<version>.vsix` to the project's generic package registry, once per version. `devbox/agntree.tf` is the coder-templates script that unzips it into `~/.vscode-server/extensions` at each workspace start.
+- A devbox starts on a new disk every time, so nothing the extension saves survives a stop. That is why it adds the open folder's repository by itself (`agntree.autoAddWorkspaceRepositories`, `repositoriesForFolders`).
+- `devbox/` and `.gitlab-ci.yml` are excluded from the VSIX (`.vscodeignore`).
 
 ## Unit Tests
 
@@ -53,7 +63,7 @@ Commands are registered in `package.json` under `contributes.commands` and imple
 
 ### Data Flow
 
-1. User adds a repository → stored in this machine's state file
+1. User adds a repository, or the window's open folder adds its own → stored in this machine's state file. `GitService.getRepoRoot()` gives the main worktree, also from inside a linked one such as a Claude worktree
 2. GitService detects worktrees via `git worktree list --porcelain`
 3. User creates a session → TerminalManager starts it with `claude --session-id <uuid>` and resumes it later with `claude --resume <sessionId>` (see Session Linking)
 4. Sessions link to Claude Code's session files for resumption

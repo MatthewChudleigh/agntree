@@ -1,6 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
+import { isWithin } from '../utils/paths';
+import { SessionNamer, claudeConfigDir, promptText } from '../utils/sessionLog';
+
+/**
+ * Claude Code may shorten very long project folder names, so prefix matching compares at
+ * most this many characters. Comparing fewer only means a few extra folders are read.
+ */
+const MAX_PREFIX_LENGTH = 200;
 
 /**
  * Represents an existing Claude Code session discovered from ~/.claude/projects
@@ -34,9 +42,11 @@ export class ClaudeSessionService {
   /** Cache of parsed sessions keyed by file path, invalidated by mtime/size. */
   private parseCache = new Map<string, { mtimeMs: number; size: number; session: ClaudeSession | null }>();
 
+  /** Where each session's log was last found, so lookups don't re-scan every project folder. */
+  private sessionFiles = new Map<string, string>();
+
   constructor() {
-    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
-    this.claudeDir = path.join(homeDir, '.claude');
+    this.claudeDir = claudeConfigDir();
     this.projectsDir = path.join(this.claudeDir, 'projects');
   }
 
@@ -75,9 +85,14 @@ export class ClaudeSessionService {
    * Robust against path-encoding edge cases and forked sessions.
    */
   private findSessionFilePath(sessionId: string): string | null {
+    const known = this.sessionFiles.get(sessionId);
+    if (known && fs.existsSync(known)) {
+      return known;
+    }
     for (const dir of this.getProjectDirs()) {
       const fp = path.join(dir, `${sessionId}.jsonl`);
       if (fs.existsSync(fp)) {
+        this.sessionFiles.set(sessionId, fp);
         return fp;
       }
     }
@@ -85,26 +100,35 @@ export class ClaudeSessionService {
   }
 
   /**
-   * Extract the first text content from a session message entry (string, or content blocks).
+   * Project folders that can hold sessions started in or below any of `cwds`. Claude Code
+   * names each folder after the session's starting directory, so a session started
+   * anywhere inside a path is in a folder whose name starts with that path's encoding.
    */
-  private extractUserText(message: unknown): string {
-    if (typeof message === 'string') {
-      return message;
-    }
-    if (message && typeof message === 'object') {
-      const content = (message as { content?: unknown }).content;
-      if (typeof content === 'string') {
-        return content;
-      }
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          if (block && block.type === 'text' && typeof block.text === 'string' && block.text) {
-            return block.text;
+  private getProjectDirsFor(cwds: string[]): string[] {
+    const foldCase = process.platform === 'win32' || process.platform === 'darwin';
+    const normalize = (name: string) => (foldCase ? name.toLowerCase() : name);
+    const prefixes = cwds.map((cwd) => normalize(this.encodeProjectPath(cwd)).slice(0, MAX_PREFIX_LENGTH));
+    return this.getProjectDirs().filter((dir) => {
+      const name = normalize(path.basename(dir));
+      return prefixes.some((prefix) => name.startsWith(prefix));
+    });
+  }
+
+  /** IDs of every session log on this machine (file names only; nothing is parsed). */
+  listSessionIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const dir of this.getProjectDirs()) {
+      try {
+        for (const file of fs.readdirSync(dir)) {
+          if (file.endsWith('.jsonl') && !file.startsWith('agent-')) {
+            ids.add(file.slice(0, -'.jsonl'.length));
           }
         }
+      } catch {
+        // Skip folders we can't read
       }
     }
-    return '';
+    return ids;
   }
 
   /**
@@ -155,6 +179,9 @@ export class ClaudeSessionService {
     for (const file of files) {
       const filePath = path.join(projectDir, file);
       const sessionId = file.replace('.jsonl', '');
+      if (!this.sessionFiles.has(sessionId)) {
+        this.sessionFiles.set(sessionId, filePath);
+      }
 
       try {
         const session = await this.parseSessionFile(filePath, sessionId);
@@ -204,7 +231,7 @@ export class ClaudeSessionService {
       messageCount: 0,
     };
 
-    let firstUserPrompt: string | null = null;
+    const namer = new SessionNamer();
     let latestRecapTimestamp = 0;
 
     try {
@@ -218,10 +245,8 @@ export class ClaudeSessionService {
           return; // Skip invalid JSON lines
         }
 
-        // Get summary (prefer the last one as it's usually most descriptive)
-        if (entry.type === 'summary' && entry.summary) {
-          session.summary = entry.summary as string;
-        }
+        // Name: the latest recorded title, else the first prompt the user typed
+        namer.add(entry);
 
         // Get recap from away_summary entries — keep the most recent by timestamp
         if (entry.type === 'system' && entry.subtype === 'away_summary' && entry.content) {
@@ -230,14 +255,6 @@ export class ClaudeSessionService {
             latestRecapTimestamp = ts;
             // Strip the trailing "(disable recaps in /config)" hint
             session.recap = (entry.content as string).replace(/\s*\(disable recaps in \/config\)\s*$/, '').trim();
-          }
-        }
-
-        // Get first user prompt as fallback for summary
-        if (!firstUserPrompt && entry.type === 'user' && entry.message) {
-          const text = this.extractUserText(entry.message);
-          if (text) {
-            firstUserPrompt = text;
           }
         }
 
@@ -259,10 +276,7 @@ export class ClaudeSessionService {
       return null;
     }
 
-    // Use first user prompt as fallback if no summary
-    if (!session.summary && firstUserPrompt) {
-      session.summary = this.truncateName(firstUserPrompt);
-    }
+    session.summary = namer.name;
 
     // Skip sessions without a working directory
     const result = session.cwd ? session : null;
@@ -274,8 +288,12 @@ export class ClaudeSessionService {
    * Get all sessions across all projects
    */
   async getAllSessionsFlat(): Promise<ClaudeSession[]> {
+    return this.getSessionsInDirs(this.getProjectDirs());
+  }
+
+  /** Sessions in the given project folders, most recently updated first. */
+  private async getSessionsInDirs(projectDirs: string[]): Promise<ClaudeSession[]> {
     const allSessions: ClaudeSession[] = [];
-    const projectDirs = this.getProjectDirs();
 
     for (const dir of projectDirs) {
       const sessions = await this.getSessionsInDir(dir);
@@ -297,17 +315,7 @@ export class ClaudeSessionService {
    * Matches sessions where the session's cwd equals or starts with the worktree path
    */
   async findSessionsForWorktree(worktreePath: string): Promise<ClaudeSession[]> {
-    const normalizedPath = path.resolve(worktreePath);
-    const allSessions = await this.getAllSessionsFlat();
-
-    // Filter sessions that match this worktree
-    const matching = allSessions.filter(session => {
-      const sessionCwd = path.resolve(session.cwd);
-      // Exact match or session is in a subdirectory of worktree
-      return sessionCwd === normalizedPath || sessionCwd.startsWith(normalizedPath + '/');
-    });
-
-    return matching;
+    return this.findSessionsUnder([worktreePath]);
   }
 
   /**
@@ -315,24 +323,16 @@ export class ClaudeSessionService {
    * Matches sessions whose cwd equals or is a subdirectory of any provided path
    */
   async findSessionsForRepository(repoRootPath: string, worktreePaths: string[]): Promise<ClaudeSession[]> {
-    // Collect all paths to check: repo root + all worktree paths (deduplicated)
-    const normalizedPaths = new Set<string>();
-    normalizedPaths.add(path.resolve(repoRootPath));
-    for (const wtPath of worktreePaths) {
-      normalizedPaths.add(path.resolve(wtPath));
-    }
+    return this.findSessionsUnder([repoRootPath, ...worktreePaths]);
+  }
 
-    const allSessions = await this.getAllSessionsFlat();
-
-    return allSessions.filter(session => {
-      const sessionCwd = path.resolve(session.cwd);
-      for (const normalizedPath of normalizedPaths) {
-        if (sessionCwd === normalizedPath || sessionCwd.startsWith(normalizedPath + '/')) {
-          return true;
-        }
-      }
-      return false;
-    });
+  /**
+   * Sessions started in or below any of `paths`. Only the project folders named after those
+   * paths are read, not every session log on the machine (which can be gigabytes).
+   */
+  private async findSessionsUnder(paths: string[]): Promise<ClaudeSession[]> {
+    const sessions = await this.getSessionsInDirs(this.getProjectDirsFor(paths));
+    return sessions.filter((session) => paths.some((p) => isWithin(p, session.cwd)));
   }
 
   /**
@@ -483,8 +483,8 @@ export class ClaudeSessionService {
    * Get the last few user messages from a session (for preview).
    * Streamed with a rolling buffer so only the last N messages are ever held in memory.
    */
-  async getSessionPreview(sessionId: string, maxMessages: number = 3): Promise<string[]> {
-    const filePath = this.findSessionFilePath(sessionId);
+  async getSessionPreview(sessionId: string, maxMessages: number = 3, knownFilePath?: string): Promise<string[]> {
+    const filePath = knownFilePath ?? this.findSessionFilePath(sessionId);
     if (!filePath) {
       return [];
     }
@@ -499,14 +499,12 @@ export class ClaudeSessionService {
         } catch {
           return; // Skip invalid lines
         }
-        if (entry.type === 'user' && entry.message) {
-          const text = this.extractUserText(entry.message);
-          if (text) {
-            const truncated = text.length > 100 ? text.substring(0, 100) + '...' : text;
-            recent.push(truncated.replace(/\n/g, ' '));
-            if (recent.length > maxMessages) {
-              recent.shift();
-            }
+        const text = promptText(entry);
+        if (text) {
+          const truncated = text.length > 100 ? text.substring(0, 100) + '...' : text;
+          recent.push(truncated.replace(/\n/g, ' '));
+          if (recent.length > maxMessages) {
+            recent.shift();
           }
         }
       });
@@ -550,28 +548,5 @@ export class ClaudeSessionService {
     }
 
     return latestRecap;
-  }
-
-  /**
-   * Truncate a name to a reasonable length for display
-   */
-  private truncateName(text: string): string {
-    // Clean up the text
-    const cleaned = text
-      .replace(/\n/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    // Truncate to ~50 chars, respecting word boundaries
-    if (cleaned.length <= 50) {
-      return cleaned;
-    }
-
-    const truncated = cleaned.substring(0, 50);
-    const lastSpace = truncated.lastIndexOf(' ');
-    if (lastSpace > 30) {
-      return truncated.substring(0, lastSpace) + '...';
-    }
-    return truncated + '...';
   }
 }

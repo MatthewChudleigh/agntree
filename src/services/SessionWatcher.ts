@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { StorageService } from './StorageService';
 import { Worktree } from '../types';
+import { SessionNamer, claudeConfigDir } from '../utils/sessionLog';
 
 interface PendingChat {
   chatId: string;
@@ -26,8 +27,7 @@ export class SessionWatcher {
   public readonly onChatNameUpdated = this._onChatNameUpdated.event;
 
   constructor(private storageService: StorageService) {
-    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
-    this.projectsDir = path.join(homeDir, '.claude', 'projects');
+    this.projectsDir = path.join(claudeConfigDir(), 'projects');
   }
 
   private isSessionFile(filename: string): boolean {
@@ -295,8 +295,13 @@ export class SessionWatcher {
     return normalizedPath.replace(/[^a-zA-Z0-9]/g, '-');
   }
 
+  /** How long to keep waiting for Claude Code to record a title after naming a chat from its first prompt. */
+  private static readonly TITLE_WAIT_MS = 10 * 60 * 1000;
+
   /**
-   * Monitor a session file for name updates (first prompt or summary)
+   * Monitor a session file for its name. The first prompt names the chat as soon as it is
+   * typed; Claude Code's own title (a `custom-title` entry, written shortly afterwards)
+   * replaces it, unless the user has renamed the chat in the meantime.
    */
   private monitorSessionForName(chatId: string, sessionFilePath: string): void {
     // Clear any existing interval for this chat
@@ -305,38 +310,54 @@ export class SessionWatcher {
       clearInterval(existingInterval);
     }
 
+    let autoName: string | undefined;
+    let namedAt = 0;
+    const stop = () => {
+      clearInterval(checkInterval);
+      this.monitoringIntervals.delete(chatId);
+    };
+    const rename = (name: string) => {
+      this.storageService.renameChat(chatId, name);
+      this._onChatNameUpdated.fire({ chatId, name });
+    };
+
     const checkInterval = setInterval(() => {
       const chat = this.storageService.getChat(chatId);
+      const stillAutoNamed = chat && (chat.name.startsWith('New Session') || chat.name === autoName);
 
-      // Stop if chat was deleted, already renamed, or session is no longer running
-      if (!chat || !chat.name.startsWith('New Session') || chat.status !== 'active') {
-        clearInterval(checkInterval);
-        this.monitoringIntervals.delete(chatId);
+      // Stop if chat was deleted, renamed by the user, or session is no longer running
+      if (!chat || !stillAutoNamed || chat.status !== 'active') {
+        stop();
         return;
       }
 
-      const nameFromFile = this.extractNameFromSessionFile(sessionFilePath);
-      if (nameFromFile) {
-        this.storageService.renameChat(chatId, nameFromFile);
-        this._onChatNameUpdated.fire({ chatId, name: nameFromFile });
-        clearInterval(checkInterval);
-        this.monitoringIntervals.delete(chatId);
+      const namer = this.readNames(sessionFilePath);
+      const name = namer?.name;
+      if (namer?.hasTitle && name) {
+        if (name !== chat.name) {
+          rename(name);
+        }
+        stop();
+      } else if (name && autoName === undefined) {
+        autoName = name;
+        namedAt = Date.now();
+        rename(name);
+      } else if (autoName !== undefined && Date.now() - namedAt > SessionWatcher.TITLE_WAIT_MS) {
+        stop(); // named from the first prompt; Claude Code never recorded a title
       }
     }, 5000);
 
     this.monitoringIntervals.set(chatId, checkInterval);
   }
 
-  /**
-   * Extract name from session file (looks for summary or first user message)
-   */
-  private extractNameFromSessionFile(filePath: string): string | null {
+  /** Read a session log's title and first prompt. */
+  private readNames(filePath: string): SessionNamer | null {
     try {
       if (!fs.existsSync(filePath)) {
         return null;
       }
 
-      // Read only a bounded prefix. The summary and first user prompt appear near the
+      // Read only a bounded prefix. The title and first user prompt appear near the
       // top of the log, and this runs on a 5s poll, so we must not read a whole large file.
       const maxBytes = 512 * 1024;
       const fd = fs.openSync(filePath, 'r');
@@ -354,82 +375,19 @@ export class SessionWatcher {
       // Drop a trailing partial line if we hit the byte cap.
       const lines = truncated ? rawLines.slice(0, -1) : rawLines;
 
-      let summary: string | null = null;
-      let firstUserPrompt: string | null = null;
-
+      const namer = new SessionNamer();
       for (const line of lines) {
         if (!line.trim()) continue;
-
         try {
-          const entry = JSON.parse(line);
-
-          // Check for summary (prefer the latest one)
-          if (entry.type === 'summary' && entry.summary) {
-            summary = entry.summary;
-          }
-
-          // Get first user prompt
-          if (!firstUserPrompt && entry.type === 'user' && entry.message) {
-            let text = '';
-            if (typeof entry.message === 'string') {
-              text = entry.message;
-            } else if (entry.message.content) {
-              if (Array.isArray(entry.message.content)) {
-                for (const block of entry.message.content) {
-                  if (block.type === 'text' && block.text) {
-                    text = block.text;
-                    break;
-                  }
-                }
-              } else if (typeof entry.message.content === 'string') {
-                text = entry.message.content;
-              }
-            }
-            if (text) {
-              firstUserPrompt = text;
-            }
-          }
+          namer.add(JSON.parse(line));
         } catch {
           // Skip invalid JSON
         }
       }
-
-      // Return summary if available, otherwise first prompt
-      if (summary) {
-        return this.truncateName(summary);
-      }
-
-      if (firstUserPrompt) {
-        return this.truncateName(firstUserPrompt);
-      }
-
-      return null;
+      return namer;
     } catch {
       return null;
     }
-  }
-
-  /**
-   * Truncate a name to a reasonable length for display
-   */
-  private truncateName(text: string): string {
-    // Clean up the text
-    const cleaned = text
-      .replace(/\n/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    // Truncate to ~50 chars, respecting word boundaries
-    if (cleaned.length <= 50) {
-      return cleaned;
-    }
-
-    const truncated = cleaned.substring(0, 50);
-    const lastSpace = truncated.lastIndexOf(' ');
-    if (lastSpace > 30) {
-      return truncated.substring(0, lastSpace) + '...';
-    }
-    return truncated + '...';
   }
 
   /**

@@ -25,6 +25,16 @@ describe('package.json', () => {
     assert.ok(['application', 'machine'].includes(scope), `agntree.quickActions scope is ${scope}`);
   });
 
+  it('hides Reveal in Finder in remote windows, where it does nothing', () => {
+    const items = (contributes.menus['view/item/context'] as { command: string; when: string }[]).filter(
+      (item) => item.command === 'agntree.files.revealInFinder'
+    );
+    assert.ok(items.length > 0);
+    for (const item of items) {
+      assert.match(item.when, /&& !remoteName$/);
+    }
+  });
+
   it('scopes every keybinding with a when clause, so none override built-ins like Save As', () => {
     for (const binding of contributes.keybindings ?? []) {
       assert.ok(binding.when, `${binding.command} (${binding.key}) has no when clause`);

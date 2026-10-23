@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import type { ChildProcess } from 'child_process';
+import { killProcessTree, stopProcessTree } from '../utils/processes';
 
 /**
  * Quick Action type from settings
@@ -54,6 +55,11 @@ export class QuickActionItem extends vscode.TreeItem {
  * Provides tree data for the Quick Actions view
  */
 export class QuickActionsTreeProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
+  /** How long a stopped action gets to exit before it is killed outright. */
+  private static readonly KILL_AFTER_MS = 5000;
+  /** How long after that to wait for its output to close before showing it as stopped anyway. */
+  private static readonly GIVE_UP_AFTER_MS = 2000;
+
   private _onDidChangeTreeData = new vscode.EventEmitter<vscode.TreeItem | undefined | null>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
@@ -62,6 +68,9 @@ export class QuickActionsTreeProvider implements vscode.TreeDataProvider<vscode.
 
   /** Track running actions by index -> process */
   private runningProcesses: Map<number, ChildProcess> = new Map();
+
+  /** Stop requests in progress (they force-kill actions that ignore SIGTERM) */
+  private stopping: Map<number, { cancel(): void }> = new Map();
 
   constructor() {}
 
@@ -96,39 +105,39 @@ export class QuickActionsTreeProvider implements vscode.TreeDataProvider<vscode.
   }
 
   /**
-   * Mark an action as stopped
+   * Mark an action as stopped (called once its output has closed). With `process`, only if
+   * that process is still the one recorded, so a late event from an earlier run can't
+   * clear a newer run of the same action.
    */
-  setActionStopped(index: number): void {
+  setActionStopped(index: number, process?: ChildProcess): void {
+    if (process && this.runningProcesses.get(index) !== process) {
+      return;
+    }
     this.runningProcesses.delete(index);
+    this.stopping.get(index)?.cancel();
+    this.stopping.delete(index);
     this.refresh();
   }
 
   /**
-   * Stop a running action by killing its process
+   * Stop a running action and everything it started. It stays "running" until its output
+   * closes; if it ignores the request it is killed after a few seconds, and if its output
+   * still doesn't close it is shown as stopped anyway.
    */
   stopAction(index: number): boolean {
     const childProcess = this.runningProcesses.get(index);
-    if (childProcess) {
-      // Kill the process tree (important for shell commands)
-      try {
-        if (childProcess.pid) {
-          // On Windows, use taskkill for process tree
-          if (process.platform === 'win32') {
-            require('child_process').spawn('taskkill', ['/pid', childProcess.pid.toString(), '/T', '/F']);
-          } else {
-            // On Unix, kill the process group
-            childProcess.kill('SIGTERM');
-          }
-        }
-      } catch {
-        // Fallback to regular kill
-        childProcess.kill();
-      }
-      this.runningProcesses.delete(index);
-      this.refresh();
-      return true;
+    if (!childProcess) {
+      return false;
     }
-    return false;
+    if (!this.stopping.has(index)) {
+      this.stopping.set(index, stopProcessTree(childProcess, {
+        killAfterMs: QuickActionsTreeProvider.KILL_AFTER_MS,
+        giveUpAfterMs: QuickActionsTreeProvider.GIVE_UP_AFTER_MS,
+        isDone: () => this.runningProcesses.get(index) !== childProcess,
+        onGiveUp: () => this.setActionStopped(index, childProcess),
+      }));
+    }
+    return true;
   }
 
   /**
@@ -139,23 +148,17 @@ export class QuickActionsTreeProvider implements vscode.TreeDataProvider<vscode.
   }
 
   /**
-   * Dispose of resources — kill all running processes
+   * Dispose of resources — stop all running processes
    */
   dispose(): void {
     for (const [, childProcess] of this.runningProcesses) {
-      try {
-        if (childProcess.pid) {
-          if (process.platform === 'win32') {
-            require('child_process').spawn('taskkill', ['/pid', childProcess.pid.toString(), '/T', '/F']);
-          } else {
-            childProcess.kill('SIGTERM');
-          }
-        }
-      } catch {
-        try { childProcess.kill(); } catch { /* ignore */ }
-      }
+      killProcessTree(childProcess, 'SIGTERM');
     }
     this.runningProcesses.clear();
+    for (const stop of this.stopping.values()) {
+      stop.cancel();
+    }
+    this.stopping.clear();
     this._onDidChangeTreeData.dispose();
   }
 

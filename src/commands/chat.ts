@@ -8,7 +8,7 @@ import { SessionWatcher } from '../services/SessionWatcher';
 import { WorkspaceTreeItem, WorkspacesTreeProvider } from '../providers/WorkspacesTreeProvider';
 import { ChangesTreeProvider, ChangeTreeItem, ChangeSectionItem } from '../providers/ChangesTreeProvider';
 import { ChatSession, Worktree } from '../types';
-import { samePath } from '../utils/paths';
+import { isWithin, samePath } from '../utils/paths';
 
 /**
  * Register chat-related commands
@@ -686,13 +686,12 @@ export function registerChatCommands(
 
         // Match each session to a worktree by comparing cwd
         const matchSessionToWorktree = (session: { cwd: string }): Worktree => {
-          const sessionCwd = path.resolve(session.cwd);
           // Find the worktree whose path best matches (longest match wins)
           let bestMatch: Worktree | undefined;
           let bestMatchLen = 0;
           for (const wt of worktrees) {
             const wtPath = path.resolve(wt.path);
-            if (sessionCwd === wtPath || sessionCwd.startsWith(wtPath + '/')) {
+            if (isWithin(wtPath, session.cwd)) {
               if (wtPath.length > bestMatchLen) {
                 bestMatch = wt;
                 bestMatchLen = wtPath.length;
@@ -740,7 +739,7 @@ export function registerChatCommands(
           allSessions.map(async (session) => {
             previewCache.set(
               session.sessionId,
-              await claudeSessionService.getSessionPreview(session.sessionId, 5)
+              await claudeSessionService.getSessionPreview(session.sessionId, 5, session.filePath)
             );
           })
         );

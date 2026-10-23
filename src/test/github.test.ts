@@ -1,6 +1,98 @@
 import { describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { findRemoteForPullRequest, normalizeRemoteUrl, parsePullRequestUrl, pullRequestRepoUrl } from '../utils/github';
+import {
+  GhPullRequest,
+  findRemoteForPullRequest,
+  indexPullRequests,
+  normalizeRemoteUrl,
+  parsePullRequestUrl,
+  pullRequestNumberForWorktree,
+  pullRequestRepoUrl,
+  remoteOwners,
+  toPRInfo,
+} from '../utils/github';
+
+describe('indexPullRequests', () => {
+  // As `gh pr list --state all --json ...` prints them: newest first, states upper-case.
+  const pr = (number: number, headRefName: string, state: string, extra: Partial<GhPullRequest> = {}): GhPullRequest => ({
+    number,
+    title: `PR ${number}`,
+    state,
+    isDraft: false,
+    url: `https://github.com/o/r/pull/${number}`,
+    headRefName,
+    isCrossRepository: false,
+    ...extra,
+  });
+
+  it('shows merged and closed PRs, not only open ones', () => {
+    const { byBranch } = indexPullRequests([pr(3, 'claude/eager-feynman', 'MERGED'), pr(2, 'feature/old', 'CLOSED')]);
+    assert.equal(byBranch.get('claude/eager-feynman')?.state, 'merged');
+    assert.equal(byBranch.get('feature/old')?.state, 'closed');
+  });
+
+  it("prefers a branch's open PR, then its newest one", () => {
+    const { byBranch } = indexPullRequests([
+      pr(9, 'feature/a', 'CLOSED'),
+      pr(8, 'feature/a', 'OPEN'),
+      pr(7, 'feature/b', 'MERGED'),
+      pr(6, 'feature/b', 'CLOSED'),
+    ]);
+    assert.equal(byBranch.get('feature/a')?.number, 8);
+    assert.equal(byBranch.get('feature/b')?.number, 7);
+  });
+
+  it("doesn't match someone else's fork branch to the local branch of the same name", () => {
+    const { byBranch, byNumber } = indexPullRequests(
+      [
+        pr(5, 'main', 'OPEN', { isCrossRepository: true, headRepositoryOwner: { login: 'stranger' } }),
+        pr(4, 'patch-1', 'OPEN', { isCrossRepository: true, headRepositoryOwner: { login: 'stranger' } }),
+      ],
+      ['you', 'upstream-org']
+    );
+    assert.equal(byBranch.size, 0);
+    // Still findable by number, for worktrees made by Checkout PR.
+    assert.equal(byNumber.get(5)?.headRefName, 'main');
+  });
+
+  it('matches PRs from your own fork (origin is a fork, gh reports PRs against upstream)', () => {
+    const { byBranch } = indexPullRequests(
+      [pr(6, 'claude/fix-login', 'MERGED', { isCrossRepository: true, headRepositoryOwner: { login: 'You' } })],
+      ['you', 'upstream-org']
+    );
+    assert.equal(byBranch.get('claude/fix-login')?.number, 6);
+  });
+
+  it('reads the owners of the remotes', () => {
+    assert.deepEqual(
+      remoteOwners([
+        { url: 'git@github.com:You/app.git' },
+        { url: 'https://github.com/upstream-org/app.git' },
+        { url: '/srv/git/local.git' },
+      ]),
+      ['you', 'upstream-org']
+    );
+  });
+
+  it('normalizes states and fills in missing fields', () => {
+    assert.deepEqual(toPRInfo({ number: 1, state: 'OPEN' }), { number: 1, title: '', state: 'open', isDraft: false, url: '', headRefName: '' });
+    assert.equal(toPRInfo({ number: 1, state: 'SOMETHING_NEW' }).state, 'closed');
+  });
+});
+
+describe('pullRequestNumberForWorktree', () => {
+  it('recognizes worktrees made by Checkout PR, by recorded number or pr-<n> branch', () => {
+    assert.equal(pullRequestNumberForWorktree('pr-4267', undefined), 4267);
+    assert.equal(pullRequestNumberForWorktree('feature/login', 12), 12);
+    assert.equal(pullRequestNumberForWorktree(null, 12), 12);
+  });
+
+  it('treats other worktrees as not from a PR', () => {
+    for (const branch of ['main', 'claude/eager-feynman-8ff4f6', 'pr-', 'pr-12-fix', 'fix/pr-12', null]) {
+      assert.equal(pullRequestNumberForWorktree(branch, undefined), undefined, String(branch));
+    }
+  });
+});
 
 describe('parsePullRequestUrl', () => {
   it('reads host, owner, repo and number', () => {

@@ -1,6 +1,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { PRInfo } from '../types';
+import { GH_PR_FIELDS, GhPullRequest, RepoPullRequests, indexPullRequests, toPRInfo } from '../utils/github';
 
 const execFileAsync = promisify(execFile);
 
@@ -8,8 +9,19 @@ const execFileAsync = promisify(execFile);
  * Service for interacting with GitHub via the gh CLI
  */
 export class GitHubService {
-  /** Cache of PR info by repo:branch key */
-  private prCache: Map<string, PRInfo | null> = new Map();
+  /** How many open PRs to read per repository for the worktree badges, however old. */
+  private static readonly OPEN_PR_LIMIT = 500;
+  /** How many recent PRs in any state (for merged and closed badges). */
+  private static readonly RECENT_PR_LIMIT = 200;
+
+  /** PRs by repository path */
+  private prCache = new Map<string, RepoPullRequests>();
+
+  /** Fetches in progress, so a repository is only asked for once at a time */
+  private inflight = new Map<string, Promise<RepoPullRequests>>();
+
+  /** Bumped by clearCache, so a fetch that started before it doesn't refill the cache. */
+  private generation = 0;
 
   /** Whether gh CLI is available (cached) */
   private ghAvailable: boolean | null = null;
@@ -40,85 +52,62 @@ export class GitHubService {
     return this.ghCheckPromise;
   }
 
+  /** A repository's PRs if they have been fetched since the last clearCache, else undefined. */
+  getCachedPullRequests(repoPath: string): RepoPullRequests | undefined {
+    return this.prCache.get(repoPath);
+  }
+
   /**
-   * Get cached PR info for a branch (synchronous, returns null if not cached)
+   * Fetch a repository's PRs with two `gh pr list` calls (rather than one per worktree):
+   * every open PR, and the most recent ones in any state so merged and closed PRs show
+   * too. Failures give an empty result, which is cached like any other until the next
+   * clearCache.
+   * @param ownOwners owners of the repository's remotes; see {@link indexPullRequests}
    */
-  getCachedPRInfo(repoPath: string, branchName: string): PRInfo | null | undefined {
-    const cacheKey = `${repoPath}:${branchName}`;
-    if (this.prCache.has(cacheKey)) {
-      return this.prCache.get(cacheKey) ?? null;
+  fetchPullRequests(repoPath: string, ownOwners: string[] = []): Promise<RepoPullRequests> {
+    const running = this.inflight.get(repoPath);
+    if (running) {
+      return running;
     }
-    return undefined; // Not in cache yet
-  }
-
-  /**
-   * Check if PR info is cached for a branch
-   */
-  isCached(repoPath: string, branchName: string): boolean {
-    const cacheKey = `${repoPath}:${branchName}`;
-    return this.prCache.has(cacheKey);
-  }
-
-  /**
-   * Fetch PR info for a branch (async, updates cache)
-   */
-  async fetchPRInfo(repoPath: string, branchName: string): Promise<PRInfo | null> {
-    if (!(await this.isGhAvailable())) return null;
-
-    const cacheKey = `${repoPath}:${branchName}`;
-
-    try {
-      // Use execFileAsync with array args to prevent command injection
-      const { stdout } = await execFileAsync(
-        'gh',
-        ['pr', 'list', '--head', branchName, '--json', 'number,title,state,isDraft,url', '--limit', '1'],
-        { cwd: repoPath, timeout: 10000 }
-      );
-      const prs = JSON.parse(stdout);
-      if (prs.length === 0) {
-        this.prCache.set(cacheKey, null);
-        return null;
+    const generation = this.generation;
+    const list = async (state: string, limit: number): Promise<GhPullRequest[]> => {
+      try {
+        const { stdout } = await execFileAsync(
+          'gh',
+          ['pr', 'list', '--state', state, '--limit', String(limit), '--json', GH_PR_FIELDS],
+          { cwd: repoPath, timeout: 20000, maxBuffer: 16 * 1024 * 1024 }
+        );
+        return JSON.parse(stdout) as GhPullRequest[];
+      } catch {
+        return []; // Not a GitHub repository, gh not signed in, offline, ...
       }
-      const pr = prs[0];
-
-      // Validate state from GitHub API
-      const validStates = ['open', 'merged', 'closed'] as const;
-      const state = pr.state?.toLowerCase() || 'closed';
-      const validatedState: PRInfo['state'] = validStates.includes(state)
-        ? (state as PRInfo['state'])
-        : 'closed';
-
-      const prInfo: PRInfo = {
-        number: pr.number,
-        title: pr.title || '',
-        state: validatedState,
-        isDraft: pr.isDraft ?? false,
-        url: pr.url || '',
-      };
-      this.prCache.set(cacheKey, prInfo);
-      return prInfo;
-    } catch {
-      this.prCache.set(cacheKey, null);
-      return null;
-    }
-  }
-
-  /**
-   * Get PR info for a branch (async) - fetches if not cached
-   */
-  async getPRInfo(repoPath: string, branchName: string): Promise<PRInfo | null> {
-    const cached = this.getCachedPRInfo(repoPath, branchName);
-    if (cached !== undefined) {
-      return cached;
-    }
-    return this.fetchPRInfo(repoPath, branchName);
+    };
+    const fetch = (async () => {
+      let result: RepoPullRequests = { byBranch: new Map(), byNumber: new Map() };
+      if (await this.isGhAvailable()) {
+        const [recent, open] = await Promise.all([
+          list('all', GitHubService.RECENT_PR_LIMIT),
+          list('open', GitHubService.OPEN_PR_LIMIT),
+        ]);
+        result = indexPullRequests([...recent, ...open], ownOwners);
+      }
+      if (generation === this.generation) {
+        this.prCache.set(repoPath, result);
+        this.inflight.delete(repoPath);
+      }
+      return result;
+    })();
+    this.inflight.set(repoPath, fetch);
+    return fetch;
   }
 
   /**
    * Clear the cache
    */
   clearCache(): void {
+    this.generation++;
     this.prCache.clear();
+    this.inflight.clear();
   }
 
   /**
@@ -130,18 +119,10 @@ export class GitHubService {
     try {
       const { stdout } = await execFileAsync(
         'gh',
-        ['pr', 'list', '--json', 'number,title,state,isDraft,url,headRefName', '--limit', '30'],
+        ['pr', 'list', '--json', GH_PR_FIELDS, '--limit', '30'],
         { cwd: repoPath, timeout: 15000 }
       );
-      const prs = JSON.parse(stdout);
-      return prs.map((pr: Record<string, unknown>) => ({
-        number: pr.number as number,
-        title: (pr.title as string) || '',
-        state: 'open' as const,
-        isDraft: (pr.isDraft as boolean) ?? false,
-        url: (pr.url as string) || '',
-        headRefName: (pr.headRefName as string) || '',
-      }));
+      return (JSON.parse(stdout) as GhPullRequest[]).map(toPRInfo);
     } catch {
       return [];
     }
@@ -156,25 +137,10 @@ export class GitHubService {
     try {
       const { stdout } = await execFileAsync(
         'gh',
-        ['pr', 'view', prRef, '--json', 'number,title,state,isDraft,url,headRefName'],
+        ['pr', 'view', prRef, '--json', GH_PR_FIELDS],
         { cwd: repoPath, timeout: 10000 }
       );
-      const pr = JSON.parse(stdout);
-
-      const validStates = ['open', 'merged', 'closed'] as const;
-      const state = pr.state?.toLowerCase() || 'closed';
-      const validatedState: PRInfo['state'] = validStates.includes(state)
-        ? (state as PRInfo['state'])
-        : 'closed';
-
-      return {
-        number: pr.number,
-        title: pr.title || '',
-        state: validatedState,
-        isDraft: pr.isDraft ?? false,
-        url: pr.url || '',
-        headRefName: pr.headRefName || '',
-      };
+      return toPRInfo(JSON.parse(stdout) as GhPullRequest);
     } catch {
       return null;
     }
@@ -184,7 +150,7 @@ export class GitHubService {
    * Format PR info for display in tree item description
    * Returns: "#123", "#123 ○" (draft), "#123 ✓" (merged), "#123 ✗" (closed)
    */
-  formatPRDescription(prInfo: PRInfo | null): string {
+  formatPRDescription(prInfo: PRInfo | null | undefined): string {
     if (!prInfo) return '';
 
     const symbol = prInfo.isDraft

@@ -419,31 +419,42 @@ export class GitService {
     });
   }
 
+  /**
+   * Remove a worktree with `git worktree remove`. Only git deletes files: when git refuses
+   * (for example because the folder's `.git` is missing or is a whole repository of its
+   * own), the folder is left alone and git's reason is returned. A worktree whose folder
+   * is already gone is pruned instead.
+   */
   async removeWorktree(repoPath: string, worktreePath: string, force: boolean = false): Promise<GitResult> {
+    if (!(await this.exists(worktreePath))) {
+      return this.pruneMissingWorktree(repoPath, worktreePath);
+    }
     const result = await this.attempt(['worktree', 'remove', ...(force ? ['--force'] : []), '--', worktreePath], {
       cwd: repoPath,
       timeoutMs: GIT_TIMEOUTS.long,
     });
-    if (result.ok) {
+    if (result.ok || !/validation failed|is not a \.git file/.test(result.error)) {
       return result;
     }
-    // A worktree whose .git is a directory instead of a file can't be removed by git.
-    if (result.error.includes('is not a .git file') || result.error.includes('error code 3')) {
-      console.log('Worktree has invalid .git structure, attempting manual cleanup...');
-      return this.forceRemoveWorktree(repoPath, worktreePath);
-    }
-    return result;
+    return {
+      ok: false,
+      error:
+        `git no longer recognizes "${worktreePath}" as a worktree (${result.error}). Nothing was deleted: ` +
+        'the folder may hold files or a repository of its own. If you don\'t need it, delete the folder yourself and refresh.',
+    };
   }
 
-  private async forceRemoveWorktree(repoPath: string, worktreePath: string): Promise<GitResult> {
-    try {
-      await this.tryRun(['worktree', 'prune'], { cwd: repoPath });
-      await fs.promises.rm(path.resolve(worktreePath), { recursive: true, force: true });
-      await this.tryRun(['worktree', 'prune'], { cwd: repoPath });
-      return { ok: true };
-    } catch (error) {
-      return { ok: false, error: describeGitError(error) };
+  /** Drop git's record of a worktree whose folder no longer exists. */
+  private async pruneMissingWorktree(repoPath: string, worktreePath: string): Promise<GitResult> {
+    const pruned = await this.attempt(['worktree', 'prune'], { cwd: repoPath });
+    if (!pruned.ok) {
+      return pruned;
     }
+    const output = await this.tryRun(['worktree', 'list', '--porcelain'], { cwd: repoPath });
+    const stillListed = parseWorktreeList(output ?? '').some((entry) => path.resolve(entry.path) === path.resolve(worktreePath));
+    return stillListed
+      ? { ok: false, error: `"${worktreePath}" is missing, but git still lists it (it may be locked). Run "git worktree prune" or unlock it.` }
+      : { ok: true };
   }
 
   // ============ Branches ============

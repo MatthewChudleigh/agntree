@@ -24,8 +24,25 @@ export function makeTempDir(prefix = 'agntree-test-'): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+/**
+ * Delete a directory. Keeps trying for up to 10 seconds while it is busy: on Windows a
+ * folder can't be deleted while a process uses it as its working directory, and the
+ * timeout tests leave a {@link slowCommand} running for a few seconds after they kill git.
+ * (`rmSync`'s own `maxRetries` doesn't retry EBUSY for a folder in use.)
+ */
 export function removeDir(dir: string): void {
-  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EBUSY' || Date.now() > deadline) {
+        throw error;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+    }
+  }
 }
 
 /** Run git synchronously, for test setup and assertions only. */

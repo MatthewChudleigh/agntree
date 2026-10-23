@@ -88,6 +88,11 @@ export function registerFileCommands(
     }),
 
     vscode.commands.registerCommand('agntree.files.revealInFinder', (item: FileTreeItem) => {
+      // The menu item is hidden in remote windows, where revealFileInOS silently does nothing.
+      if (vscode.env.remoteName) {
+        vscode.window.showInformationMessage(`Can't reveal files in the OS file manager in a remote (${vscode.env.remoteName}) window.`);
+        return;
+      }
       vscode.commands.executeCommand('revealFileInOS', item.uri);
     }),
 
@@ -140,15 +145,42 @@ export function registerFileCommands(
     vscode.commands.registerCommand('agntree.files.delete', async (item: FileTreeItem) => {
       const name = path.basename(item.uri.fsPath);
       const isFolder = (item.fileType & vscode.FileType.Directory) !== 0;
+      const kind = isFolder ? 'folder' : 'file';
+      // Remote windows (Remote-SSH, which Coder uses, WSL, containers) have no trash, and
+      // VS Code refuses useTrash there, so say up front that the delete is permanent.
+      const remote = vscode.env.remoteName;
       const answer = await vscode.window.showWarningMessage(
-        `Delete ${isFolder ? 'folder' : 'file'} "${name}"?`,
-        { modal: true },
+        remote ? `Permanently delete ${kind} "${name}"?` : `Delete ${kind} "${name}"?`,
+        {
+          modal: true,
+          detail: remote ? `This can't be undone: there is no trash in a remote (${remote}) window.` : 'You can restore it from the trash.',
+        },
         'Delete'
       );
       if (answer !== 'Delete') { return; }
-      try {
-        await vscode.workspace.fs.delete(item.uri, { recursive: isFolder, useTrash: true });
+
+      const deletePermanently = async () => {
+        await vscode.workspace.fs.delete(item.uri, { recursive: isFolder, useTrash: false });
         filesProvider.refresh();
+      };
+      try {
+        if (remote) {
+          await deletePermanently();
+          return;
+        }
+        try {
+          await vscode.workspace.fs.delete(item.uri, { recursive: isFolder, useTrash: true });
+          filesProvider.refresh();
+        } catch (trashError) {
+          const retry = await vscode.window.showWarningMessage(
+            `Couldn't move "${name}" to the trash. Delete it permanently?`,
+            { modal: true, detail: `${trashError}` },
+            'Delete Permanently'
+          );
+          if (retry === 'Delete Permanently') {
+            await deletePermanently();
+          }
+        }
       } catch (err) {
         vscode.window.showErrorMessage(`Delete failed: ${err}`);
       }

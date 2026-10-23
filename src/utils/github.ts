@@ -129,6 +129,51 @@ export function normalizeRemoteUrl(url: string): string | null {
   return `${host}/${owner}/${repo}`.toLowerCase();
 }
 
+export type CloneSource = { ok: true; url: string; name: string } | { ok: false; error: string };
+
+/**
+ * What to clone for the text typed into Clone Repository, and the folder name to clone
+ * it into. Accepts `owner/repo` (GitHub), any https, ssh or git URL, and scp-style SSH
+ * addresses such as `git@github.com:owner/repo.git`, which are kept as typed. A GitHub
+ * page URL (`https://github.com/owner/repo/tree/main`) clones the repository itself.
+ */
+export function parseCloneUrl(input: string): CloneSource {
+  const typed = input.trim();
+  if (!typed) {
+    return { ok: false, error: 'Repository URL is required' };
+  }
+  // `github.com/owner/repo`, pasted without the scheme
+  const text = /^(?:www\.)?github\.com\//i.test(typed) ? `https://${typed}` : typed;
+
+  let url = text;
+  let repoPath: string;
+  const shorthand = /^([A-Za-z0-9_-][A-Za-z0-9_.-]*)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(text);
+  const scpLike = /^[^@/\s]+@[^:/\s]+:(?!\/)(\S+)$/.exec(text);
+  const urlLike = /^(?:https?|ssh|git):\/\/[^/\s]+\/(\S+)$/i.exec(text);
+  const githubPage = /^https?:\/\/(?:www\.)?github\.com\/([^/\s?#]+)\/([^/\s?#]+)/i.exec(text);
+
+  if (shorthand) {
+    url = `https://github.com/${shorthand[1]}/${shorthand[2]}.git`;
+    repoPath = shorthand[2];
+  } else if (githubPage) {
+    const repo = githubPage[2].replace(/\.git$/i, '');
+    url = `https://github.com/${githubPage[1]}/${repo}.git`;
+    repoPath = repo;
+  } else if (urlLike) {
+    repoPath = urlLike[1];
+  } else if (scpLike) {
+    repoPath = scpLike[1];
+  } else {
+    return { ok: false, error: 'Enter a repository URL (https://…, ssh://… or git@host:owner/repo) or owner/repo' };
+  }
+
+  const name = (repoPath.replace(/[?#].*$/, '').replace(/\/+$/, '').split(/[/:]/).pop() ?? '').replace(/\.git$/i, '');
+  if (!NAME.test(name) || name === '.' || name === '..') {
+    return { ok: false, error: `Can't tell the repository's name from "${text}".` };
+  }
+  return { ok: true, url, name };
+}
+
 /** Name of the remote that points at the PR's repository, if there is one. */
 export function findRemoteForPullRequest(
   remotes: { name: string; url: string }[],

@@ -482,15 +482,158 @@ describe('known bugs (todo)', () => {
     const root = await gitService.getRepoRoot(nested);
     assert.ok(root && samePath(root, repo));
   });
+});
 
-  it('creates a local branch when a remote branch is picked as an existing branch', { todo: 'picking origin/<branch> in Create Worktree makes a detached worktree' }, async () => {
-    const dir = scratch('todo-remote-branch');
+describe('createWorktree from a remote branch', () => {
+  function cloneWithRemoteBranch(name: string): string {
+    const dir = scratch(name);
     const origin = initRepo(path.join(dir, 'origin'));
     git(origin, 'branch', 'feature/remote-only');
     const clone = path.join(dir, 'clone');
     git(dir, 'clone', '-q', origin, clone);
-    const worktreePath = path.join(dir, 'clone-worktrees', 'remote-only');
-    await gitService.createWorktree(clone, 'origin/feature/remote-only', worktreePath);
-    assert.notEqual(git(worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'HEAD');
+    return clone;
+  }
+
+  it('creates a local branch that tracks it, rather than a detached worktree', async () => {
+    const clone = cloneWithRemoteBranch('remote-branch');
+    const worktreePath = path.join(path.dirname(clone), 'clone-worktrees', 'remote-only');
+    assert.deepEqual(await gitService.createWorktree(clone, 'origin/feature/remote-only', worktreePath), { ok: true });
+    assert.equal(git(worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'feature/remote-only');
+    assert.equal(git(worktreePath, 'rev-parse', '--abbrev-ref', '@{upstream}').trim(), 'origin/feature/remote-only');
+  });
+
+  it('refuses when a local branch of that name already exists', async () => {
+    const clone = cloneWithRemoteBranch('remote-branch-exists');
+    git(clone, 'branch', 'feature/remote-only', 'origin/feature/remote-only');
+    const worktreePath = path.join(path.dirname(clone), 'clone-worktrees', 'remote-only');
+    const result = await gitService.createWorktree(clone, 'origin/feature/remote-only', worktreePath);
+    assert.equal(result.ok, false);
+    assert.match(!result.ok ? result.error : '', /already exists/);
+    assert.equal(fs.existsSync(worktreePath), false);
+  });
+
+  it('still checks out a local branch whose name contains a slash', async () => {
+    const repo = initRepo(path.join(scratch('local-slash'), 'repo'));
+    git(repo, 'branch', 'origin/not-a-remote');
+    const worktreePath = path.join(path.dirname(repo), 'wt');
+    assert.deepEqual(await gitService.createWorktree(repo, 'origin/not-a-remote', worktreePath), { ok: true });
+    assert.equal(git(worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'origin/not-a-remote');
+  });
+});
+
+describe('removeWorktree with nested worktrees', () => {
+  /** A repo with worktree A at .claude/worktrees/a, and worktree B inside A (ignored, as Claude Code sets it up). */
+  function nestedWorktrees(name: string): { repo: string; a: string; b: string } {
+    const repo = initRepo(path.join(scratch(name), 'repo'));
+    fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), '.claude/worktrees/\n');
+    const a = path.join(repo, '.claude', 'worktrees', 'a');
+    git(repo, 'worktree', 'add', '-q', '-b', 'claude/a', a);
+    const b = path.join(a, '.claude', 'worktrees', 'b');
+    git(a, 'worktree', 'add', '-q', '-b', 'claude/b', b);
+    writeFile(b, 'unsaved.txt', 'work in progress\n');
+    return { repo, a, b };
+  }
+
+  it('refuses to remove a worktree that contains another one, and deletes nothing', async () => {
+    const { repo, a, b } = nestedWorktrees('nested-remove');
+    // git itself would delete B along with A: A looks clean because B is ignored.
+    assert.equal(git(a, 'status', '--porcelain').trim(), '');
+
+    const result = await gitService.removeWorktree(repo, a);
+    assert.equal(result.ok, false);
+    assert.match(!result.ok ? result.error : '', /contains another worktree/);
+    assert.equal(fs.readFileSync(path.join(b, 'unsaved.txt'), 'utf-8'), 'work in progress\n');
+    assert.ok(fs.existsSync(a));
+  });
+
+  it('removes the inner worktree, then the outer one', async () => {
+    const { repo, a, b } = nestedWorktrees('nested-remove-order');
+    assert.deepEqual(await gitService.removeWorktree(repo, b, true), { ok: true });
+    assert.deepEqual(await gitService.removeWorktree(repo, a), { ok: true });
+    assert.equal(fs.existsSync(a), false);
+  });
+
+  it('lists the worktrees inside a folder', async () => {
+    const { repo, a, b } = nestedWorktrees('nested-list');
+    const inClaudeFolder = await gitService.worktreesWithin(repo, path.join(repo, '.claude'));
+    assert.deepEqual(inClaudeFolder.map((p) => samePath(p, a) || samePath(p, b)), [true, true]);
+    assert.deepEqual(await gitService.worktreesWithin(repo, path.join(repo, 'src')), []);
+  });
+});
+
+describe('countCommitsOnNoBranch', () => {
+  it('counts commits made on a detached HEAD until a branch holds them', async () => {
+    const repo = initRepo(path.join(scratch('detached-commits'), 'repo'));
+    const worktreePath = path.join(path.dirname(repo), 'detached');
+    git(repo, 'worktree', 'add', '-q', '--detach', worktreePath);
+    assert.equal(await gitService.countCommitsOnNoBranch(worktreePath), 0);
+
+    commitFile(worktreePath, 'a.txt', 'a\n');
+    commitFile(worktreePath, 'b.txt', 'b\n');
+    assert.equal(await gitService.countCommitsOnNoBranch(worktreePath), 2);
+
+    git(worktreePath, 'branch', 'keep-these');
+    assert.equal(await gitService.countCommitsOnNoBranch(worktreePath), 0);
+  });
+});
+
+describe('rebase --autostash', () => {
+  it('reports a conflict putting the stashed changes back, which git exits 0 for', async () => {
+    const repo = initRepo(path.join(scratch('autostash-conflict'), 'repo'), { 'f.txt': 'base\n' });
+    git(repo, 'branch', 'feature');
+    commitFile(repo, 'f.txt', 'main\n');
+    git(repo, 'checkout', '-q', 'feature');
+    writeFile(repo, 'f.txt', 'my uncommitted edit\n');
+
+    const result = await gitService.rebase(repo, 'main');
+    assert.equal(result.ok, false);
+    assert.deepEqual(!result.ok && result.autostashConflicts, ['f.txt']);
+    assert.match(!result.ok ? result.error : '', /stash/);
+    // The original edit is still in the stash, as the message says.
+    assert.match(git(repo, 'stash', 'list'), /autostash/);
+    assert.equal(await gitService.isRebaseInProgress(repo), false);
+  });
+
+  it('still reports a clean rebase with stashed changes as a success', async () => {
+    const repo = initRepo(path.join(scratch('autostash-clean'), 'repo'), { 'f.txt': 'base\n', 'g.txt': 'g\n' });
+    git(repo, 'branch', 'feature');
+    commitFile(repo, 'f.txt', 'main\n');
+    git(repo, 'checkout', '-q', 'feature');
+    writeFile(repo, 'g.txt', 'my uncommitted edit\n');
+
+    assert.deepEqual(await gitService.rebase(repo, 'main'), { ok: true });
+    assert.equal(fs.readFileSync(path.join(repo, 'g.txt'), 'utf-8'), 'my uncommitted edit\n');
+  });
+});
+
+describe('file paths that look like globs', () => {
+  // Next.js-style routes: `[id]` is a glob character class matching `i` or `d`.
+  const files = { 'app/[id]/page.tsx': 'route\n', 'app/i/page.tsx': 'i\n', 'app/d/page.tsx': 'd\n' };
+
+  function editAll(repo: string): void {
+    for (const file of Object.keys(files)) {
+      writeFile(repo, file, 'edited\n');
+    }
+  }
+
+  it('discards only the named file', async () => {
+    const repo = initRepo(path.join(scratch('glob-discard'), 'repo'), files);
+    editAll(repo);
+    const result = await gitService.discardChange(repo, { path: 'app/[id]/page.tsx', status: 'modified', additions: 1, deletions: 1 });
+    assert.deepEqual(result, { ok: true });
+    assert.equal(fs.readFileSync(path.join(repo, 'app/[id]/page.tsx'), 'utf-8'), 'route\n');
+    assert.equal(fs.readFileSync(path.join(repo, 'app/i/page.tsx'), 'utf-8'), 'edited\n');
+    assert.equal(fs.readFileSync(path.join(repo, 'app/d/page.tsx'), 'utf-8'), 'edited\n');
+  });
+
+  it('stages and unstages only the named file', async () => {
+    const repo = initRepo(path.join(scratch('glob-stage'), 'repo'), files);
+    editAll(repo);
+    assert.deepEqual(await gitService.stageFiles(repo, ['app/[id]/page.tsx']), { ok: true });
+    assert.equal(git(repo, 'diff', '--cached', '--name-only').trim(), 'app/[id]/page.tsx');
+
+    git(repo, 'add', '-A');
+    assert.deepEqual(await gitService.unstageFiles(repo, ['app/[id]/page.tsx']), { ok: true });
+    assert.deepEqual(git(repo, 'diff', '--cached', '--name-only').trim().split('\n').sort(), ['app/d/page.tsx', 'app/i/page.tsx']);
   });
 });

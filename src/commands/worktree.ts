@@ -3,8 +3,10 @@ import * as path from 'path';
 import { StorageService } from '../services/StorageService';
 import { GitService } from '../services/GitService';
 import { GitHubService } from '../services/GitHubService';
+import { LiveSessionService } from '../services/LiveSessionService';
+import { TerminalManager } from '../services/TerminalManager';
 import { WorkspaceTreeItem } from '../providers/WorkspacesTreeProvider';
-import { Repository, Worktree } from '../types';
+import { ChatSession, Repository, Worktree } from '../types';
 import { samePath } from '../utils/paths';
 import { findRemoteForPullRequest, parsePullRequestUrl, pullRequestRepoUrl } from '../utils/github';
 import { withCancellableProgress, withProgress } from '../utils/progress';
@@ -46,9 +48,35 @@ export function registerWorktreeCommands(
   context: vscode.ExtensionContext,
   storageService: StorageService,
   gitService: GitService,
+  terminalManager: TerminalManager,
+  liveSessions: LiveSessionService,
   refreshTree: () => void,
   getPRUrl: (worktreeId: string) => string | undefined
 ): void {
+  /**
+   * Names of the Claude sessions running in a worktree: its chats with a terminal in this
+   * window, and any Claude process on this machine whose working directory is inside it.
+   */
+  async function runningSessionNames(worktree: Worktree, chats: ChatSession[]): Promise<string[]> {
+    const names: string[] = [];
+    const seen = new Set<string>();
+    for (const chat of chats) {
+      if (terminalManager.isActive(chat.id)) {
+        names.push(`"${chat.name}"`);
+        if (chat.claudeSessionId) {
+          seen.add(chat.claudeSessionId);
+        }
+      }
+    }
+    for (const session of await liveSessions.within(worktree.path)) {
+      if (!seen.has(session.sessionId)) {
+        seen.add(session.sessionId);
+        names.push(session.name ? `"${session.name}"` : `session ${session.sessionId.slice(0, 8)}`);
+      }
+    }
+    return names;
+  }
+
   // Add Worktree
   context.subscriptions.push(
     vscode.commands.registerCommand(
@@ -355,7 +383,25 @@ export function registerWorktreeCommands(
           return;
         }
 
-        const hasChanges = await gitService.hasUncommittedChanges(worktree.path);
+        // git would delete worktrees nested inside this one (e.g. in its .claude/worktrees/)
+        // along with it. removeWorktree refuses too; checking first keeps the sessions open.
+        const nested = (await gitService.worktreesWithin(repo.rootPath, worktree.path).catch(() => [] as string[]))
+          .filter((p) => !samePath(p, worktree.path));
+        if (nested.length > 0) {
+          vscode.window.showErrorMessage(
+            `"${worktree.name}" contains other worktrees, which deleting it would delete too: ${nested.join(', ')}. Delete those first.`
+          );
+          return;
+        }
+
+        const chats = storageService.getChatsByWorktree(worktree.id);
+        const [hasChanges, lostCommits, running] = await Promise.all([
+          gitService.hasUncommittedChanges(worktree.path),
+          // A detached HEAD's commits are on no branch, and removing the worktree drops the
+          // only record of them (its reflog).
+          worktree.branch ? Promise.resolve(0) : gitService.countCommitsOnNoBranch(worktree.path),
+          runningSessionNames(worktree, chats),
+        ]);
 
         const message = [`Delete worktree "${worktree.name}"?`, '', `Folder: ${worktree.path}`];
         // Only a real branch can be deleted. A detached worktree's name is just its folder
@@ -364,14 +410,35 @@ export function registerWorktreeCommands(
         if (hasChanges) {
           message.push('', '⚠️ WARNING: This worktree has uncommitted changes that will be lost!');
         }
+        if (lostCommits > 0) {
+          message.push(
+            '',
+            `⚠️ WARNING: HEAD has ${lostCommits === 1 ? '1 commit' : `${lostCommits} commits`} that no branch contains. ` +
+              'They will be lost. To keep them, cancel and run "git branch <name>" in the worktree.'
+          );
+        }
+        if (running.length > 0) {
+          message.push(
+            '',
+            `⚠️ Claude is running in this worktree: ${running.join(', ')}. ` +
+              'Sessions open in this window will be closed; any others keep running in a folder that no longer exists.'
+          );
+        }
 
-        const deleteWorktreeOnly = hasChanges ? 'Delete Worktree Only (force)' : 'Delete Worktree Only';
+        const lose = lostCommits > 0 ? ` (lose ${lostCommits === 1 ? '1 commit' : `${lostCommits} commits`})` : '';
+        const deleteWorktreeOnly = hasChanges ? `Delete Worktree Only (force)${lose}` : `Delete Worktree Only${lose}`;
         const deleteWithBranch = hasChanges ? 'Delete Worktree & Branch (force)' : 'Delete Worktree & Branch';
         const choices = worktree.branch ? [deleteWorktreeOnly, deleteWithBranch] : [deleteWorktreeOnly];
 
         const confirm = await vscode.window.showWarningMessage(message.join('\n'), { modal: true }, ...choices);
         if (!confirm) {
           return;
+        }
+
+        // Stop this window's sessions first, so Claude isn't writing while git deletes the
+        // folder (and Windows doesn't refuse to delete a folder a process runs in).
+        for (const chat of chats) {
+          terminalManager.closeChat(chat.id);
         }
 
         const removed = await withProgress(`Deleting worktree ${worktree.name}...`, () =>
@@ -382,8 +449,10 @@ export function registerWorktreeCommands(
           return;
         }
 
-        // The PR association is keyed by path; don't let it attach to a future worktree there.
+        // The PR association and chats are keyed by path; don't let them attach to a future
+        // worktree there. The Claude sessions stay in ~/.claude and can be imported again.
         storageService.removePRWorktree(worktree.id);
+        storageService.deleteChatsByWorktree(worktree.id);
 
         if (confirm === deleteWithBranch && worktree.branch) {
           await deleteBranchSafely(gitService, repo.rootPath, worktree.branch);
@@ -524,12 +593,14 @@ export function registerWorktreeCommands(
           if (!choice) {
             return;
           }
+          // Pass this worktree's path: without it the commands act on the worktree the
+          // Changes panel shows, which may be a different one.
           if (choice.value === 'continue') {
-            vscode.commands.executeCommand('agntree.rebaseContinue');
+            vscode.commands.executeCommand('agntree.rebaseContinue', worktree.path);
           } else if (choice.value === 'abort') {
-            vscode.commands.executeCommand('agntree.rebaseAbort');
+            vscode.commands.executeCommand('agntree.rebaseAbort', worktree.path);
           } else {
-            vscode.commands.executeCommand('agntree.rebaseSkip');
+            vscode.commands.executeCommand('agntree.rebaseSkip', worktree.path);
           }
           return;
         }
@@ -650,6 +721,9 @@ export function registerWorktreeCommands(
           vscode.window.showInformationMessage(
             `Successfully rebased "${worktree.name}" onto ${targetBranch}`
           );
+          refreshTree();
+        } else if (result.autostashConflicts) {
+          vscode.window.showWarningMessage(`Rebasing "${worktree.name}" onto ${targetBranch}: ${result.error}`);
           refreshTree();
         } else if (await gitService.isRebaseInProgress(worktree.path)) {
           vscode.window.showWarningMessage(

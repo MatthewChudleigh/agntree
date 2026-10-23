@@ -2,6 +2,7 @@ import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Worktree, FileChange, WorkingTreeStatus } from '../types';
+import { isWithin, samePath } from '../utils/paths';
 
 /** Time limits for git commands, in milliseconds. 0 means no limit. */
 export const GIT_TIMEOUTS = {
@@ -71,6 +72,13 @@ export function describeGitError(error: unknown): string {
 export type GitResult = { ok: true } | { ok: false; error: string };
 
 export type MergeResult = { ok: true } | { ok: false; conflicts: string[]; error: string };
+
+/**
+ * `autostashConflicts` is set when the rebase itself finished but putting back the
+ * uncommitted changes it stashed (`--autostash`) conflicted. git exits 0 in that case,
+ * leaves conflict markers in the files, and keeps the changes in the stash.
+ */
+export type RebaseResult = { ok: true } | { ok: false; error: string; autostashConflicts?: string[] };
 
 export type DeleteBranchResult =
   | { deleted: true }
@@ -278,6 +286,9 @@ export class GitService {
     // Background status refreshes must not take index.lock, or an agent's concurrent
     // `git commit` in the same worktree can fail with "index.lock exists".
     GIT_OPTIONAL_LOCKS: '0',
+    // File paths are passed as pathspecs, which git otherwise reads as globs: discarding
+    // `app/[id]/page.tsx` would also discard `app/i/page.tsx` and `app/d/page.tsx`.
+    GIT_LITERAL_PATHSPECS: '1',
   };
 
   /** Run git and resolve with stdout. Rejects with a {@link GitError}. */
@@ -403,8 +414,65 @@ export class GitService {
     return Math.abs(hash).toString(16).padStart(8, '0');
   }
 
+  /**
+   * Create a worktree for an existing branch. A remote-tracking branch (`origin/feature`)
+   * gets a local branch (`feature`) that tracks it, since checking out `origin/feature`
+   * directly would leave HEAD detached and commits made there on no branch.
+   */
   async createWorktree(repoPath: string, branch: string, worktreePath: string): Promise<GitResult> {
+    const remoteBranch = await this.splitRemoteBranch(repoPath, branch);
+    if (remoteBranch) {
+      const local = remoteBranch.branch;
+      if (await this.refExists(repoPath, `refs/heads/${local}`)) {
+        return { ok: false, error: `A local branch "${local}" already exists. Choose "${local}" instead of "${branch}".` };
+      }
+      return this.attempt(['worktree', 'add', '--track', '-b', local, '--', worktreePath, branch], {
+        cwd: repoPath,
+        timeoutMs: GIT_TIMEOUTS.long,
+      });
+    }
     return this.attempt(['worktree', 'add', '--', worktreePath, branch], { cwd: repoPath, timeoutMs: GIT_TIMEOUTS.long });
+  }
+
+  /**
+   * If `name` is a remote-tracking branch and not a local branch, its remote and branch
+   * (`origin/feature/x` → `origin`, `feature/x`). The longest matching remote name wins.
+   */
+  private async splitRemoteBranch(repoPath: string, name: string): Promise<{ remote: string; branch: string } | null> {
+    if ((await this.refExists(repoPath, `refs/heads/${name}`)) || !(await this.refExists(repoPath, `refs/remotes/${name}`))) {
+      return null;
+    }
+    const remote = (await this.listRemotes(repoPath))
+      .filter((r) => name.startsWith(`${r}/`) && name.length > r.length + 1)
+      .sort((a, b) => b.length - a.length)[0];
+    return remote ? { remote, branch: name.slice(remote.length + 1) } : null;
+  }
+
+  private async refExists(repoPath: string, ref: string): Promise<boolean> {
+    return (await this.tryRun(['rev-parse', '--verify', '-q', ref], { cwd: repoPath })) !== null;
+  }
+
+  /** Paths of the repository's worktrees that are `dirPath` itself or inside it. */
+  async worktreesWithin(repoPath: string, dirPath: string): Promise<string[]> {
+    const output = await this.run(['worktree', 'list', '--porcelain'], { cwd: repoPath });
+    return parseWorktreeList(output)
+      .filter((entry) => !entry.bare && isWithin(dirPath, entry.path))
+      .map((entry) => entry.path);
+  }
+
+  /**
+   * How many commits HEAD has that no branch, remote-tracking branch or tag contains.
+   * In a detached worktree these are lost (only the worktree's own reflog knows them)
+   * when the worktree is removed.
+   */
+  async countCommitsOnNoBranch(worktreePath: string): Promise<number> {
+    if (!(await this.getCurrentCommit(worktreePath))) {
+      return 0;
+    }
+    const output = await this.tryRun(['rev-list', '--count', 'HEAD', '--not', '--branches', '--remotes', '--tags'], {
+      cwd: worktreePath,
+    });
+    return output ? Number(output.trim()) || 0 : 0;
   }
 
   async createWorktreeWithNewBranch(
@@ -428,6 +496,23 @@ export class GitService {
   async removeWorktree(repoPath: string, worktreePath: string, force: boolean = false): Promise<GitResult> {
     if (!(await this.exists(worktreePath))) {
       return this.pruneMissingWorktree(repoPath, worktreePath);
+    }
+    // git deletes the whole folder, including worktrees nested inside it (Claude Code puts
+    // them in `.claude/worktrees/`, which is usually ignored, so status doesn't show them).
+    let nested: string[];
+    try {
+      nested = (await this.worktreesWithin(repoPath, worktreePath)).filter((p) => !samePath(p, worktreePath));
+    } catch (error) {
+      return { ok: false, error: `Couldn't check for worktrees inside "${worktreePath}": ${describeGitError(error)}` };
+    }
+    if (nested.length > 0) {
+      return {
+        ok: false,
+        error:
+          `"${worktreePath}" contains ${nested.length === 1 ? 'another worktree' : `${nested.length} other worktrees`} ` +
+          `(${nested.join(', ')}). Removing it would delete ${nested.length === 1 ? 'that worktree' : 'them'} too, ` +
+          'with any uncommitted work. Delete the nested worktrees first.',
+      };
     }
     const result = await this.attempt(['worktree', 'remove', ...(force ? ['--force'] : []), '--', worktreePath], {
       cwd: repoPath,
@@ -831,23 +916,42 @@ export class GitService {
   /** Environment for rebase steps: never open an editor (GIT_EDITOR beats core.editor). */
   private static readonly NO_EDITOR = { GIT_EDITOR: 'true' };
 
-  async rebase(worktreePath: string, onto: string): Promise<GitResult> {
-    return this.attempt(['rebase', '--autostash', onto], { cwd: worktreePath, timeoutMs: GIT_TIMEOUTS.long, env: GitService.NO_EDITOR });
+  async rebase(worktreePath: string, onto: string): Promise<RebaseResult> {
+    return this.rebaseStep(worktreePath, ['rebase', '--autostash', onto]);
   }
 
-  async rebaseContinue(worktreePath: string): Promise<GitResult> {
-    return this.attempt(['-c', 'core.editor=true', 'rebase', '--continue'], {
-      cwd: worktreePath,
-      timeoutMs: GIT_TIMEOUTS.long,
-      env: GitService.NO_EDITOR,
-    });
+  async rebaseContinue(worktreePath: string): Promise<RebaseResult> {
+    return this.rebaseStep(worktreePath, ['-c', 'core.editor=true', 'rebase', '--continue']);
   }
 
   async rebaseAbort(worktreePath: string): Promise<GitResult> {
     return this.attempt(['rebase', '--abort'], { cwd: worktreePath, timeoutMs: GIT_TIMEOUTS.long });
   }
 
-  async rebaseSkip(worktreePath: string): Promise<GitResult> {
-    return this.attempt(['rebase', '--skip'], { cwd: worktreePath, timeoutMs: GIT_TIMEOUTS.long, env: GitService.NO_EDITOR });
+  async rebaseSkip(worktreePath: string): Promise<RebaseResult> {
+    return this.rebaseStep(worktreePath, ['rebase', '--skip']);
+  }
+
+  /**
+   * Run a rebase command. When it completes the rebase, git puts back the changes it
+   * auto-stashed; if that conflicts, git still exits 0, so check for conflicted files.
+   */
+  private async rebaseStep(worktreePath: string, args: string[]): Promise<RebaseResult> {
+    const result = await this.attempt(args, { cwd: worktreePath, timeoutMs: GIT_TIMEOUTS.long, env: GitService.NO_EDITOR });
+    if (!result.ok || (await this.isRebaseInProgress(worktreePath))) {
+      return result;
+    }
+    const conflicts = await this.getConflictedFiles(worktreePath);
+    if (conflicts.length === 0) {
+      return result;
+    }
+    return {
+      ok: false,
+      autostashConflicts: conflicts,
+      error:
+        `The rebase finished, but putting back your uncommitted changes conflicted in ${conflicts.join(', ')}. ` +
+        'Resolve the conflicts in those files. Your original changes are also kept in the stash as "autostash" ' +
+        '(the stash is shared by every worktree of this repository) until you drop that entry.',
+    };
   }
 }

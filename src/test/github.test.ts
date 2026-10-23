@@ -5,6 +5,7 @@ import {
   findRemoteForPullRequest,
   indexPullRequests,
   normalizeRemoteUrl,
+  parseCloneUrl,
   parsePullRequestUrl,
   pullRequestNumberForWorktree,
   pullRequestRepoUrl,
@@ -152,5 +153,43 @@ describe('findRemoteForPullRequest', () => {
   it('returns null when no remote matches, and builds a fetch URL instead', () => {
     assert.equal(findRemoteForPullRequest([{ name: 'origin', url: 'https://github.com/someone/else.git' }], pr), null);
     assert.equal(pullRequestRepoUrl(pr), 'https://github.com/subhashkhileri/agntree.git');
+  });
+});
+
+describe('parseCloneUrl', () => {
+  const ok = (input: string) => {
+    const source = parseCloneUrl(input);
+    assert.ok(source.ok, `${input}: ${!source.ok ? source.error : ''}`);
+    return source.ok ? { url: source.url, name: source.name } : undefined;
+  };
+
+  it('keeps SSH addresses as typed', () => {
+    assert.deepEqual(ok('git@github.com:owner/repo.git'), { url: 'git@github.com:owner/repo.git', name: 'repo' });
+    assert.deepEqual(ok('git@github.com:owner/repo'), { url: 'git@github.com:owner/repo', name: 'repo' });
+    assert.deepEqual(ok('ssh://git@github.com/owner/repo.git'), { url: 'ssh://git@github.com/owner/repo.git', name: 'repo' });
+  });
+
+  it('turns owner/repo into a GitHub URL', () => {
+    assert.deepEqual(ok('owner/repo'), { url: 'https://github.com/owner/repo.git', name: 'repo' });
+    assert.deepEqual(ok(' owner/my.repo.git '), { url: 'https://github.com/owner/my.repo.git', name: 'my.repo' });
+  });
+
+  it('clones the repository behind a GitHub page URL', () => {
+    assert.deepEqual(ok('https://github.com/owner/repo'), { url: 'https://github.com/owner/repo.git', name: 'repo' });
+    assert.deepEqual(ok('https://github.com/owner/repo/tree/main/src'), { url: 'https://github.com/owner/repo.git', name: 'repo' });
+    assert.deepEqual(ok('github.com/owner/repo'), { url: 'https://github.com/owner/repo.git', name: 'repo' });
+  });
+
+  it('keeps other hosts as typed', () => {
+    assert.deepEqual(ok('https://gitlab.example.com/group/sub/project.git'), {
+      url: 'https://gitlab.example.com/group/sub/project.git',
+      name: 'project',
+    });
+  });
+
+  it('refuses input it cannot clone into a folder of its own', () => {
+    for (const bad of ['', 'just words', '-oProxyCommand=evil', 'owner/..', 'https://github.com/owner/..', '../escape']) {
+      assert.equal(parseCloneUrl(bad).ok, false, bad);
+    }
   });
 });

@@ -5,6 +5,7 @@ import { GitService } from '../services/GitService';
 import { WorkspaceTreeItem } from '../providers/WorkspacesTreeProvider';
 import { Repository } from '../types';
 import { withCancellableProgress } from '../utils/progress';
+import { parseCloneUrl } from '../utils/github';
 
 /**
  * Register repository-related commands
@@ -118,18 +119,11 @@ export function registerRepositoryCommands(
     vscode.commands.registerCommand('agntree.cloneRepository', async () => {
       // Ask for GitHub URL
       const repoUrl = await vscode.window.showInputBox({
-        prompt: 'Enter GitHub repository URL',
-        placeHolder: 'https://github.com/owner/repo or owner/repo',
+        prompt: 'Enter a repository URL',
+        placeHolder: 'https://github.com/owner/repo, git@github.com:owner/repo.git or owner/repo',
         validateInput: (value) => {
-          if (!value || value.trim().length === 0) {
-            return 'Repository URL is required';
-          }
-          // Accept full URL or owner/repo format
-          const trimmed = value.trim();
-          if (trimmed.includes('github.com') || /^[\w-]+\/[\w.-]+$/.test(trimmed)) {
-            return undefined;
-          }
-          return 'Enter a valid GitHub URL or owner/repo format';
+          const source = parseCloneUrl(value);
+          return source.ok ? undefined : source.error;
         },
       });
 
@@ -137,19 +131,14 @@ export function registerRepositoryCommands(
         return;
       }
 
-      // Normalize URL
-      let normalizedUrl = repoUrl.trim();
-      if (!normalizedUrl.includes('://')) {
-        // Convert owner/repo to full URL
-        normalizedUrl = `https://github.com/${normalizedUrl}`;
+      // SSH addresses (git@host:owner/repo) are cloned as typed; owner/repo means GitHub.
+      const source = parseCloneUrl(repoUrl);
+      if (!source.ok) {
+        vscode.window.showErrorMessage(source.error);
+        return;
       }
-      // Ensure .git suffix for cloning
-      if (!normalizedUrl.endsWith('.git')) {
-        normalizedUrl = `${normalizedUrl}.git`;
-      }
-
-      // Extract repo name from URL
-      const repoName = path.basename(normalizedUrl, '.git');
+      const normalizedUrl = source.url;
+      const repoName = source.name;
 
       // Ask where to clone
       const folders = await vscode.window.showOpenDialog({

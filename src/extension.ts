@@ -3,6 +3,7 @@ import { StorageService } from './services/StorageService';
 import { GitService } from './services/GitService';
 import { TerminalManager } from './services/TerminalManager';
 import { SessionWatcher } from './services/SessionWatcher';
+import { LiveSessionService } from './services/LiveSessionService';
 import { WorkspacesTreeProvider } from './providers/WorkspacesTreeProvider';
 import { ChangesTreeProvider } from './providers/ChangesTreeProvider';
 import { QuickActionsTreeProvider } from './providers/QuickActionsTreeProvider';
@@ -24,14 +25,12 @@ export function activate(context: vscode.ExtensionContext) {
   // Initialize services
   const storageService = new StorageService(context);
   const gitService = new GitService();
-  const terminalManager = new TerminalManager(storageService);
   const sessionWatcher = new SessionWatcher(storageService);
+  const terminalManager = new TerminalManager(storageService, sessionWatcher);
+  const liveSessions = new LiveSessionService();
 
   // Sync terminal manager with any existing state
   terminalManager.syncWithExistingTerminals();
-
-  // Start watching for new Claude sessions
-  sessionWatcher.startWatching();
 
   // Initialize tree providers
   const workspacesProvider = new WorkspacesTreeProvider(
@@ -49,6 +48,9 @@ export function activate(context: vscode.ExtensionContext) {
   const refreshTree = () => {
     workspacesProvider.refresh();
   };
+
+  // Link chats whose session started before this window (re)loaded
+  sessionWatcher.resumePending(async (chat) => (await workspacesProvider.getWorktreeById(chat.worktreeId))?.path);
 
   // Register tree views
   const workspacesTreeView = vscode.window.createTreeView('agntree.workspacesView', {
@@ -98,6 +100,8 @@ export function activate(context: vscode.ExtensionContext) {
     context,
     storageService,
     gitService,
+    terminalManager,
+    liveSessions,
     refreshTree,
     (worktreeId) => workspacesProvider.getPRUrl(worktreeId)
   );
@@ -108,14 +112,14 @@ export function activate(context: vscode.ExtensionContext) {
     terminalManager,
     workspacesProvider,
     changesProvider,
-    sessionWatcher,
+    liveSessions,
     refreshTree
   );
   registerQuickActionCommands(context, changesProvider, quickActionsProvider, async (worktreePath) => {
     const worktree = await workspacesProvider.findWorktreeByPath(worktreePath);
     return worktree ? pullRequestNumberForWorktree(worktree.branch, storageService.getPRWorktree(worktree.id)) : undefined;
   });
-  registerFileCommands(context, filesProvider);
+  registerFileCommands(context, filesProvider, gitService);
 
   // Auto-switch workspace setting commands
   context.subscriptions.push(

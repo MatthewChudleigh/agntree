@@ -585,7 +585,9 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
     md.appendMarkdown(`**${chat.name}**\n\n`);
 
     // Status info
-    md.appendMarkdown(`Status: ${isActive ? '🟢 Active' : chat.status}\n\n`);
+    // Only this window's terminals are known here. The saved status is shared by every
+    // window on this machine, so it says nothing about this one.
+    md.appendMarkdown(`Status: ${isActive ? '🟢 Running in this window' : 'Not running in this window'}\n\n`);
     md.appendMarkdown(`Created: ${new Date(chat.createdAt).toLocaleString()}\n\n`);
     md.appendMarkdown(`Last accessed: ${new Date(chat.lastAccessedAt).toLocaleString()}\n\n`);
 

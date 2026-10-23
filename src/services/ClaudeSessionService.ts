@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
-import { isWithin } from '../utils/paths';
+import { isWithin, samePath } from '../utils/paths';
 import { SessionNamer, claudeConfigDir, promptText } from '../utils/sessionLog';
 
 /**
@@ -94,6 +94,28 @@ export class ClaudeSessionService {
       if (fs.existsSync(fp)) {
         this.sessionFiles.set(sessionId, fp);
         return fp;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The log of session `sessionId` started in `cwd`, if it exists. Looks in the project
+   * folder named after `cwd`, then in folders whose name starts with it (Claude Code
+   * shortens very long names). Reads no file contents, so it's cheap enough to poll.
+   */
+  findSessionLog(sessionId: string, cwd: string): string | null {
+    const fileName = `${sessionId}.jsonl`;
+    const expected = path.join(this.getProjectDir(cwd), fileName);
+    if (fs.existsSync(expected)) {
+      this.sessionFiles.set(sessionId, expected);
+      return expected;
+    }
+    for (const dir of this.getProjectDirsFor([cwd])) {
+      const candidate = path.join(dir, fileName);
+      if (fs.existsSync(candidate)) {
+        this.sessionFiles.set(sessionId, candidate);
+        return candidate;
       }
     }
     return null;
@@ -447,31 +469,45 @@ export class ClaudeSessionService {
   }
 
   /**
-   * Copy all session data from one worktree's project folder to another
-   * This enables forking sessions across worktrees
-   * (Based on CCManager's copyClaudeSessionData implementation)
+   * Copy one session into another worktree's project folder, so `claude --resume <id>
+   * --fork-session` run in that worktree finds it. Copies the log and the session's own
+   * folder (`<id>/`, which holds its title and subagent logs), nothing else: copying the
+   * whole project folder listed every other session twice. An existing copy is left as is.
    */
-  copySessionToWorktree(sessionId: string, sourceWorktreePath: string, destWorktreePath: string): boolean {
+  async copySessionToWorktree(sessionId: string, sourceWorktreePath: string, destWorktreePath: string): Promise<boolean> {
     try {
       // Prefer the directory that actually holds the session file; fall back to the
       // encoded source path only if the file can't be located that way.
       const sourceProjectDir = this.findProjectDirForSession(sessionId)
         ?? this.getProjectDir(sourceWorktreePath);
       const destProjectDir = this.getProjectDir(destWorktreePath);
+      const sourceLog = path.join(sourceProjectDir, `${sessionId}.jsonl`);
 
-      if (!fs.existsSync(sourceProjectDir)) {
-        console.error(`Source project directory not found: ${sourceProjectDir}`);
+      if (!fs.existsSync(sourceLog)) {
+        console.error(`Session log not found: ${sourceLog}`);
         return false;
       }
+      if (samePath(sourceProjectDir, destProjectDir)) {
+        return true;
+      }
 
-      // Copy the entire project directory recursively
-      // This preserves all session files and context
-      fs.cpSync(sourceProjectDir, destProjectDir, {
-        recursive: true,
-        force: true,
-        preserveTimestamps: true,
-      });
-
+      await fs.promises.mkdir(destProjectDir, { recursive: true });
+      try {
+        await fs.promises.copyFile(sourceLog, path.join(destProjectDir, `${sessionId}.jsonl`), fs.constants.COPYFILE_EXCL);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+          throw error;
+        }
+      }
+      const sourceFolder = path.join(sourceProjectDir, sessionId);
+      if (fs.existsSync(sourceFolder)) {
+        await fs.promises.cp(sourceFolder, path.join(destProjectDir, sessionId), {
+          recursive: true,
+          force: false,
+          errorOnExist: false,
+          preserveTimestamps: true,
+        });
+      }
       return true;
     } catch (error) {
       console.error('Failed to copy session data:', error);

@@ -3,6 +3,8 @@ import * as assert from 'node:assert/strict';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ClaudeSessionService } from '../services/ClaudeSessionService';
+import { ChatStore, SessionWatcher } from '../services/SessionWatcher';
+import { ChatSession } from '../types';
 import { makeTempDir, removeDir } from './helpers';
 
 // ClaudeSessionService reads HOME (or USERPROFILE) when constructed, so point both at a
@@ -176,6 +178,161 @@ describe('ClaudeSessionService', () => {
   });
 });
 
+/** Distinct session IDs for the tests below, which need more than `uuid` gives. */
+const sid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+
+describe('copySessionToWorktree', () => {
+  it('copies only the forked session when forking to a new worktree', async () => {
+    const repo = path.join(tmp, 'fork-repo');
+    const fork = path.join(tmp, 'fork-repo-worktrees', 'fork');
+    writeSession(repo, uuid('7'));
+    writeSession(repo, uuid('8'), { prompt: 'an unrelated session' });
+
+    const service = new ClaudeSessionService();
+    assert.equal(await service.copySessionToWorktree(uuid('7'), repo, fork), true);
+    assert.deepEqual(fs.readdirSync(service.getProjectDir(fork)), [`${uuid('7')}.jsonl`]);
+    const found = await service.findSessionsForRepository(repo, [repo, fork]);
+    assert.equal(new Set(found.map((s) => s.filePath)).size, found.length);
+    assert.equal(found.filter((s) => s.sessionId === uuid('8')).length, 1);
+  });
+
+  it("copies the session's own folder, and leaves an existing copy alone", async () => {
+    const repo = path.join(tmp, 'fork-folder-repo');
+    const fork = path.join(tmp, 'fork-folder-repo-worktrees', 'fork');
+    const log = writeSession(repo, sid(1));
+    const titleFile = path.join(path.dirname(log), sid(1), 'custom-title.json');
+    fs.mkdirSync(path.dirname(titleFile), { recursive: true });
+    fs.writeFileSync(titleFile, JSON.stringify({ customTitle: 'Fix login' }));
+
+    const service = new ClaudeSessionService();
+    const copiedLog = path.join(service.getProjectDir(fork), `${sid(1)}.jsonl`);
+    fs.mkdirSync(path.dirname(copiedLog), { recursive: true });
+    fs.writeFileSync(copiedLog, 'already here\n');
+
+    assert.equal(await service.copySessionToWorktree(sid(1), repo, fork), true);
+    assert.equal(fs.readFileSync(copiedLog, 'utf-8'), 'already here\n');
+    assert.ok(fs.existsSync(path.join(service.getProjectDir(fork), sid(1), 'custom-title.json')));
+  });
+
+  it("reports failure when the session's log doesn't exist", async () => {
+    const service = new ClaudeSessionService();
+    assert.equal(await service.copySessionToWorktree(sid(2), path.join(tmp, 'no-repo'), path.join(tmp, 'no-fork')), false);
+  });
+});
+
+/** In-memory chats, standing in for StorageService. */
+class FakeChats implements ChatStore {
+  private chats = new Map<string, ChatSession>();
+
+  add(id: string, extra: Partial<ChatSession> = {}): void {
+    this.chats.set(id, {
+      id,
+      worktreeId: 'wt',
+      name: 'New Session',
+      claudeSessionId: null,
+      createdAt: Date.now(),
+      lastAccessedAt: Date.now(),
+      status: 'active',
+      baseCommit: null,
+      ...extra,
+    });
+  }
+
+  getChat(id: string): ChatSession | undefined {
+    const chat = this.chats.get(id);
+    return chat ? { ...chat } : undefined;
+  }
+
+  getChats(): ChatSession[] {
+    return [...this.chats.values()].map((chat) => ({ ...chat }));
+  }
+
+  updateChat(id: string, updates: Partial<ChatSession>): ChatSession | undefined {
+    const chat = this.chats.get(id);
+    if (!chat) {
+      return undefined;
+    }
+    const updated = { ...chat, ...updates };
+    this.chats.set(id, updated);
+    return { ...updated };
+  }
+
+  renameChat(id: string, name: string): ChatSession | undefined {
+    return this.updateChat(id, { name });
+  }
+}
+
+describe('SessionWatcher', () => {
+  it('links a chat only to the session it started, not to other new logs in its worktree', () => {
+    const worktree = path.join(tmp, 'watcher-repo');
+    const chats = new FakeChats();
+    const watcher = new SessionWatcher(chats, new ClaudeSessionService());
+    try {
+      // Chat A has sent its first prompt; chat B was opened just after, in the same worktree.
+      chats.add('chat-a', { pendingSessionId: sid(10) });
+      chats.add('chat-b', { pendingSessionId: sid(11) });
+      writeSession(worktree, sid(10));
+      // A session something else started there (a Quick Action, another terminal)
+      writeSession(worktree, sid(12));
+
+      assert.equal(watcher.linkIfStarted('chat-b', worktree), undefined);
+      assert.equal(chats.getChat('chat-b')?.claudeSessionId, null);
+      assert.equal(watcher.linkIfStarted('chat-a', worktree)?.claudeSessionId, sid(10));
+
+      writeSession(worktree, sid(11));
+      const linked = watcher.linkIfStarted('chat-b', worktree);
+      assert.equal(linked?.claudeSessionId, sid(11));
+      assert.equal(linked?.pendingSessionId, undefined);
+    } finally {
+      watcher.dispose();
+    }
+  });
+
+  it('links a fork to its own new session, and forgets where it was forked from', () => {
+    const worktree = path.join(tmp, 'watcher-fork-repo');
+    const chats = new FakeChats();
+    const watcher = new SessionWatcher(chats, new ClaudeSessionService());
+    try {
+      writeSession(worktree, sid(20));
+      chats.add('fork', { name: 'Fork of X (abcd)', pendingSessionId: sid(21), forkFromSessionId: sid(20) });
+      assert.equal(watcher.linkIfStarted('fork', worktree), undefined);
+
+      writeSession(worktree, sid(21));
+      const linked = watcher.linkIfStarted('fork', worktree);
+      assert.equal(linked?.claudeSessionId, sid(21));
+      assert.equal(linked?.forkFromSessionId, undefined);
+    } finally {
+      watcher.dispose();
+    }
+  });
+
+  it('only links a log with a conversation when asked to', () => {
+    const worktree = path.join(tmp, 'watcher-empty-repo');
+    const chats = new FakeChats();
+    const watcher = new SessionWatcher(chats, new ClaudeSessionService());
+    try {
+      chats.add('chat', { pendingSessionId: sid(30) });
+      const dir = path.join(home, '.claude', 'projects', encode(worktree));
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, `${sid(30)}.jsonl`), JSON.stringify({ type: 'queue-operation', sessionId: sid(30) }) + '\n');
+
+      assert.equal(watcher.linkIfStarted('chat', worktree, { requireConversation: true }), undefined);
+      assert.equal(watcher.linkIfStarted('chat', worktree)?.claudeSessionId, sid(30));
+    } finally {
+      watcher.dispose();
+    }
+  });
+
+  it('finds a log by session ID in the folder for its working directory', () => {
+    const worktree = path.join(tmp, 'find-log-repo');
+    const file = writeSession(worktree, sid(40));
+    const service = new ClaudeSessionService();
+    assert.equal(service.findSessionLog(sid(40), worktree), file);
+    assert.equal(service.findSessionLog(sid(41), worktree), null);
+    assert.equal(service.findSessionLog(sid(40), path.join(tmp, 'other-repo')), null);
+  });
+});
+
 // Known bugs from the review that are not fixed yet. `todo` tests run and report, but
 // don't fail the suite; they pass once the bug is fixed.
 describe('ClaudeSessionService known bugs (todo)', () => {
@@ -185,19 +342,5 @@ describe('ClaudeSessionService known bugs (todo)', () => {
     writeSession(path.join(repo, '.claude', 'worktrees', 'eager-feynman-8ff4f6'), uuid('5'), { branch: 'claude/eager-feynman-8ff4f6' });
     const ids = (await new ClaudeSessionService().findSessionsForWorktree(repo)).map((s) => s.sessionId);
     assert.deepEqual(ids, [uuid('4')]);
-  });
-
-  it('copies only the forked session when forking to a new worktree', { todo: 'copySessionToWorktree copies the whole project folder, so Search then lists every session twice' }, async () => {
-    const repo = path.join(tmp, 'fork-repo');
-    const fork = path.join(tmp, 'fork-repo-worktrees', 'fork');
-    writeSession(repo, uuid('7'));
-    writeSession(repo, uuid('8'), { prompt: 'an unrelated session' });
-
-    const service = new ClaudeSessionService();
-    assert.equal(service.copySessionToWorktree(uuid('7'), repo, fork), true);
-    assert.deepEqual(fs.readdirSync(service.getProjectDir(fork)), [`${uuid('7')}.jsonl`]);
-    const found = await service.findSessionsForRepository(repo, [repo, fork]);
-    assert.equal(new Set(found.map((s) => s.filePath)).size, found.length);
-    assert.equal(found.filter((s) => s.sessionId === uuid('8')).length, 1);
   });
 });

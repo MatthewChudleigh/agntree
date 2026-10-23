@@ -5,6 +5,14 @@ All notable changes to Agntree will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-10-23
+
+The first published release of **Agntree for Devboxes**. The extension is the same as 1.3.0.
+
+### Fixed
+
+- **The release pipeline didn't start** — GitLab rejected `.gitlab-ci.yml` for the `v1.3.0` tag ("jobs:publish:script config should be a string"). Two lines of the publish job held `"JOB-TOKEN: …"`, and in an unquoted YAML list item `: ` makes the line a mapping instead of a string. The publish steps are now one shell block. 1.3.0 was never published.
+
 ## [1.3.0] - 2026-10-23
 
 The first release of the fork **Agntree for Devboxes**, for Coder devboxes over Remote-SSH. It includes every change since upstream 1.2.1 below.

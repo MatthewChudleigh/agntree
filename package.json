@@ -2,7 +2,7 @@
   "name": "agntree",
   "displayName": "Agntree for Devboxes",
   "description": "Fork of Agntree for Coder devboxes over Remote-SSH: see the git worktrees and branches Claude Code sessions create, and resume, fork and search those sessions. Built-in changes panel and one-click quick actions.",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "publisher": "fullhousevenues",
   "author": {
     "name": "Subhash Khileri",

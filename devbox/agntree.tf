@@ -19,7 +19,7 @@
 # published it. Workspaces take it at their next start after an update.
 
 locals {
-  agntree_version = "1.3.0"
+  agntree_version = "1.3.1"
   agntree_project = "venues/devops/agntree"
   agntree_url = format(
     "https://%s/api/v4/projects/%s/packages/generic/agntree/%s/agntree-%s.vsix",

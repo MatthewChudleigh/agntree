@@ -48,6 +48,25 @@ export function migrateLegacyState(
   };
 }
 
+/**
+ * Copy the state file another extension ID saved (`source`) into `target`, if `target` has
+ * none yet. The extension's storage folder is named after its ID, so renaming the ID (this
+ * fork was `subhashkhileri.agntree`) would otherwise start with nothing saved. Returns whether
+ * it copied. A source that isn't valid JSON is left alone and nothing is copied.
+ */
+export function adoptStateFile(source: string, target: StateStore): boolean {
+  if (target.exists() || path.resolve(source) === path.resolve(target.filePath)) {
+    return false;
+  }
+  let parsed: Partial<PersistedState>;
+  try {
+    parsed = JSON.parse(fs.readFileSync(source, 'utf-8')) as Partial<PersistedState>;
+  } catch {
+    return false;
+  }
+  return target.writeIfMissing({ ...emptyState(), ...parsed, version: 1 });
+}
+
 /** Errors that Windows reports briefly while another process opens or replaces a file. */
 const TRANSIENT = new Set(['EBUSY', 'EPERM', 'EACCES', 'EMFILE', 'ENFILE']);
 

@@ -5,10 +5,18 @@ All notable changes to Agntree will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-10-23
+
+The first release of the fork **Agntree for Devboxes**, for Coder devboxes over Remote-SSH. It includes every change since upstream 1.2.1 below.
+
+### Added
+
+- **The open folder's repository is added by itself** — Each folder open in the window adds its git repository to Workspaces, so a devbox, which starts with nothing saved, lists its checkout and Claude worktrees without "Add Repository". Turn it off with `agntree.autoAddWorkspaceRepositories`.
+- **Builds and releases on the internal GitLab** — `.gitlab-ci.yml` builds and tests every pipeline, and a `v<version>` tag publishes the VSIX to the project's generic package registry. `devbox/agntree.tf` is a draft for the devbox template that installs it at each workspace start (`devbox/README.md`).
 
 ### Changed
 
+- **New extension ID: `fullhousevenues.agntree`** — The fork had upstream's ID, `subhashkhileri.agntree`, which is on the VS Code Marketplace, so VS Code installed and updated the Marketplace extension in its place. Repositories and sessions saved under the old ID are copied over on first start. Uninstall the Marketplace Agntree: both register the same commands and views. The GitHub release workflow no longer publishes to the Marketplace.
 - **Saved data is now per machine** — Repositories and sessions were kept in VS Code's `globalState`, which lives on your local VS Code and is shared by every machine it connects to. Over Remote-SSH (including Coder), two workspaces with the same paths showed each other's sessions, and removing a "missing" session in one removed it from the other; windows could also overwrite each other's lists. They are now kept in a file on the machine itself (the extension's global storage folder; on a remote, under `~/.vscode-server`), which windows on that machine lock while saving so none of their changes are lost. On first start each machine copies over its own repositories and sessions — those whose folders and Claude Code logs exist there.
 
 ### Fixed
@@ -22,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Commits on a detached worktree were lost without warning** — Choosing a remote branch (`origin/x`) in Create Worktree checked it out detached, so commits made there were on no branch, and deleting the worktree dropped them. Remote branches now get a local branch that tracks them, and Delete Worktree warns when HEAD has commits no branch contains.
 - **File names were read as patterns** — Discarding or staging `app/[id]/page.tsx` also discarded or staged `app/i/page.tsx` and `app/d/page.tsx`. Paths are now passed to git literally.
 - **Clone Repository broke SSH addresses** — `git@github.com:owner/repo.git` became `https://github.com/git@github.com:owner/repo.git`. SSH addresses are now cloned as typed, and GitHub page URLs (`…/tree/main`) clone the repository.
+- **Add Repository from inside a Claude worktree added the worktree** — A folder in a linked worktree (such as `.claude/worktrees/<name>`) was recorded as a repository of its own, so new worktrees went under it and the repository could show twice. It now adds the main checkout.
 - **Delete Worktree could delete a folder git refused to remove** — When git didn't recognize a worktree (for example its `.git` had been replaced by a repository of its own), the folder was deleted recursively, without checking for uncommitted changes. Now only git deletes worktrees; if it refuses, nothing is deleted and the reason is shown. A worktree whose folder is already gone is pruned.
 - **Search and Import Sessions read every session log on the machine** — Finding a repository's sessions parsed all of `~/.claude/projects` first (2 minutes for 3.3 GB of logs), and each preview re-scanned every project folder synchronously. Only the folders named after the repository's paths are read now, and previews read the file already found. Sessions started in a subfolder are now found on Windows too.
 - **Session names were often Claude Code's own text** — Names came from `summary` entries, which current Claude Code doesn't write, or from the first user message, which often starts with a `<system-reminder>` block or a slash-command wrapper. Names now come from Claude Code's session title (`custom-title`), else the first thing you typed (slash commands show as `/name args`). New sessions pick up the title once Claude Code records it. Previews skip system text and tool results.

@@ -3,7 +3,7 @@ import * as assert from 'node:assert/strict';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { StateStore, migrateLegacyState } from '../services/StateStore';
+import { StateStore, adoptStateFile, migrateLegacyState } from '../services/StateStore';
 import { ChatSession, Repository } from '../types';
 import { makeTempDir, removeDir } from './helpers';
 
@@ -176,5 +176,49 @@ describe('migrateLegacyState', () => {
   it('starts empty when nothing was saved before', () => {
     const state = migrateLegacyState({}, { pathExists: () => true, sessionExists: () => true });
     assert.deepEqual(state, { version: 1, repositories: [], chats: [], prWorktrees: {}, starredChats: [] });
+  });
+});
+
+describe('adoptStateFile', () => {
+  // VS Code names each extension's storage folder after its ID, so the renamed fork
+  // (fullhousevenues.agntree) looks for state.json next to the old one (subhashkhileri.agntree).
+  function storageFolders(): { old: string; renamed: string } {
+    const globalStorage = path.dirname(stateFile());
+    return {
+      old: path.join(globalStorage, 'subhashkhileri.agntree', 'state.json'),
+      renamed: path.join(globalStorage, 'fullhousevenues.agntree', 'state.json'),
+    };
+  }
+
+  it("copies the old ID's saved repositories and sessions once", () => {
+    const { old, renamed } = storageFolders();
+    const repo: Repository = { id: 'r1', name: 'repo', rootPath: '/home/dev/work/repo' };
+    new StateStore(old).update((state) => {
+      state.repositories.push(repo);
+      state.chats.push(chat('a'));
+    });
+
+    const target = new StateStore(renamed);
+    assert.equal(adoptStateFile(old, target), true);
+    assert.deepEqual(target.read().repositories, [repo]);
+    assert.deepEqual(target.read().chats.map((c) => c.id), ['a']);
+
+    // Later changes under the new ID are never replaced by the old file
+    target.update((state) => {
+      state.chats = [];
+    });
+    assert.equal(adoptStateFile(old, target), false);
+    assert.deepEqual(new StateStore(renamed).read().chats, []);
+  });
+
+  it('copies nothing when the old ID saved nothing, or saved a file that is not JSON', () => {
+    const { old, renamed } = storageFolders();
+    const target = new StateStore(renamed);
+    assert.equal(adoptStateFile(old, target), false);
+
+    fs.mkdirSync(path.dirname(old), { recursive: true });
+    fs.writeFileSync(old, '{ not json');
+    assert.equal(adoptStateFile(old, target), false);
+    assert.equal(target.exists(), false);
   });
 });

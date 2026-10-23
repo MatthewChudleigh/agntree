@@ -359,9 +359,19 @@ export class GitService {
     return (await this.tryRun(['rev-parse', '--git-dir'], { cwd: dirPath })) !== null;
   }
 
+  /**
+   * The repository a folder belongs to: its main worktree. From a linked worktree (such as a
+   * Claude Code worktree in `.claude/worktrees/`) that is the main checkout, not the worktree,
+   * so adding the folder adds the repository with all its worktrees. Null outside a work tree.
+   */
   async getRepoRoot(dirPath: string): Promise<string | null> {
-    const output = await this.tryRun(['rev-parse', '--show-toplevel'], { cwd: dirPath });
-    return output ? output.trim() : null;
+    const toplevel = await this.tryRun(['rev-parse', '--show-toplevel'], { cwd: dirPath });
+    if (!toplevel) {
+      return null;
+    }
+    const list = await this.tryRun(['worktree', 'list', '--porcelain'], { cwd: dirPath });
+    const main = list ? parseWorktreeList(list)[0] : undefined;
+    return main && !main.bare ? main.path : toplevel.trim();
   }
 
   async clone(url: string, destination: string, signal?: AbortSignal): Promise<GitResult> {

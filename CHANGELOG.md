@@ -5,6 +5,27 @@ All notable changes to Agntree will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Delete Worktree & Branch could delete the wrong branch** — For a detached worktree (for example mid-rebase) the folder name was used as the branch name, so an unrelated branch with that name was force-deleted. Worktrees now track their real branch, detached ones offer no branch deletion, and a branch with unmerged commits is only deleted after a second confirmation that says how many commits would be lost.
+- **New File emptied existing files** — Typing an existing name into All Files → New File overwrote that file with nothing. New File, New Folder and Rename now refuse names that already exist or point outside the worktree, and say so as you type.
+- **Merge conflicts reported as a generic failure** — The worktree was left mid-merge with only "Failed to merge". The message now lists the conflicted files and offers to open a terminal or abort the merge.
+- **PR checkout switched the main checkout's branch** — It ran `gh pr checkout` in the main worktree and switched back, so anything running there briefly saw the PR's files. PRs are now fetched from `refs/pull/<n>/head` without checking anything out.
+- **Git calls froze the extension host** — Every git command ran synchronously with no timeout, and the Changes panel started one extra git process per changed file. Git now runs asynchronously with timeouts; the Changes panel uses three git calls however many files changed; fetch and clone can be cancelled; and rebase/merge never wait for an editor, even with `GIT_EDITOR` set.
+- **Changes panel showed renamed and non-ASCII files wrongly** — Renames appeared as deleted files with a `{a => b}` path, and non-ASCII names came back escaped so they couldn't be staged. Renames now show once with their old path, and unresolved conflicts get their own `!` status.
+- **Settings and shortcuts changed without asking** — Opening a diff permanently set `diffEditor.renderSideBySide` to `false` and locked the editor group; diffs now follow your own settings. `Ctrl+Shift+S` / `Cmd+Shift+S` (Starred Sessions) took over Save As everywhere; it now applies only while the Workspaces view is focused.
+- Bare repositories no longer appear as a worktree, `origin` is no longer listed as a branch, removed worktrees disappear from the tree without a manual refresh, and a deleted PR worktree's badge no longer reappears on a new worktree at the same path.
+
+### Security
+
+- **Quick actions can only be defined in user settings** — `agntree.quickActions` runs shell commands and headless Claude prompts, but could be set by any repository's `.vscode/settings.json` (including a PR checked out from a fork). It is now `application`-scoped. Move any quick actions you defined in workspace settings to your user settings.
+
+### Added
+
+- Unit tests (`npm test`) for git operations, session discovery and path handling, run against real temporary git repositories with Node's built-in test runner.
+
 ## [1.2.1] - 2026-05-17
 
 ### Added

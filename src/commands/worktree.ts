@@ -5,6 +5,39 @@ import { GitService } from '../services/GitService';
 import { GitHubService } from '../services/GitHubService';
 import { WorkspaceTreeItem } from '../providers/WorkspacesTreeProvider';
 import { Repository, Worktree } from '../types';
+import { samePath } from '../utils/paths';
+import { findRemoteForPullRequest, parsePullRequestUrl, pullRequestRepoUrl } from '../utils/github';
+import { withCancellableProgress, withProgress } from '../utils/progress';
+
+/**
+ * Delete a branch, asking before force-deleting one with unmerged commits.
+ * Called after the branch's worktree has been removed.
+ */
+async function deleteBranchSafely(gitService: GitService, repoPath: string, branch: string): Promise<void> {
+  let result = await gitService.deleteBranch(repoPath, branch);
+
+  if (!result.deleted && result.notMerged) {
+    const commits = result.unmergedCommits === 1 ? '1 commit' : `${result.unmergedCommits} commits`;
+    const choice = await vscode.window.showWarningMessage(
+      `The worktree was deleted. Branch "${branch}" has ${commits} that ${result.unmergedCommits === 1 ? 'is' : 'are'} not merged into ${result.mergeTarget}.\n\n` +
+        'Delete the branch anyway? Its unmerged commits will only be recoverable from the reflog.',
+      { modal: true },
+      'Delete Branch'
+    );
+    if (choice !== 'Delete Branch') {
+      vscode.window.showInformationMessage(`Deleted the worktree. Kept branch "${branch}" because it has unmerged commits.`);
+      return;
+    }
+    result = await gitService.deleteBranch(repoPath, branch, { force: true });
+  }
+
+  if (result.deleted) {
+    vscode.window.showInformationMessage(`Deleted worktree and branch "${branch}"`);
+  } else {
+    const reason = 'error' in result ? result.error : 'unknown error';
+    vscode.window.showWarningMessage(`The worktree was deleted, but branch "${branch}" was not: ${reason}`);
+  }
+}
 
 /**
  * Register worktree-related commands
@@ -48,19 +81,18 @@ export function registerWorktreeCommands(
 
           repo = selected.repo;
         }
+        const targetRepo = repo;
 
-        // Get available branches
-        const allBranches = gitService.getBranches(repo.rootPath);
-
-        // Get branches already checked out in worktrees
-        const existingWorktrees = gitService.listWorktrees(repo.rootPath, repo.id);
-        const checkedOutBranches = new Set(existingWorktrees.map(w => w.name));
+        // Get available branches, and those already checked out in worktrees
+        const [allBranches, existingWorktrees, hasUpstream] = await Promise.all([
+          gitService.getBranches(targetRepo.rootPath),
+          gitService.listWorktrees(targetRepo.rootPath, targetRepo.id),
+          gitService.hasRemote(targetRepo.rootPath, 'upstream'),
+        ]);
+        const checkedOutBranches = new Set(existingWorktrees.map((w) => w.branch).filter((b): b is string => !!b));
 
         // Filter out branches already in worktrees (for existing branch option)
         const availableBranches = allBranches.filter(b => !checkedOutBranches.has(b));
-
-        // Check if upstream remote exists
-        const hasUpstream = gitService.hasRemote(repo.rootPath, 'upstream');
 
         // Build options dynamically
         const worktreeOptions: { label: string; description: string; value: string }[] = [
@@ -98,6 +130,20 @@ export function registerWorktreeCommands(
         let isNewBranch = false;
         let baseBranch: string | undefined;
 
+        const validateNewBranchName = (value: string) => {
+          if (!value || value.trim().length === 0) {
+            return 'Branch name is required';
+          }
+          if (allBranches.includes(value)) {
+            return 'Branch already exists';
+          }
+          // Basic git branch name validation
+          if (!/^[\w\-\/\.]+$/.test(value)) {
+            return 'Invalid branch name. Use only letters, numbers, hyphens, slashes, and dots.';
+          }
+          return undefined;
+        };
+
         if (worktreeType.value === 'existing') {
           // Check if there are available branches
           if (availableBranches.length === 0) {
@@ -133,19 +179,7 @@ export function registerWorktreeCommands(
           const newBranchName = await vscode.window.showInputBox({
             prompt: `Enter new branch name (based on ${baseBranch})`,
             placeHolder: 'feature/my-feature',
-            validateInput: (value) => {
-              if (!value || value.trim().length === 0) {
-                return 'Branch name is required';
-              }
-              if (allBranches.includes(value)) {
-                return 'Branch already exists';
-              }
-              // Basic git branch name validation
-              if (!/^[\w\-\/\.]+$/.test(value)) {
-                return 'Invalid branch name. Use only letters, numbers, hyphens, slashes, and dots.';
-              }
-              return undefined;
-            },
+            validateInput: validateNewBranchName,
           });
 
           if (!newBranchName) {
@@ -155,20 +189,15 @@ export function registerWorktreeCommands(
           branchName = newBranchName;
           isNewBranch = true;
         } else if (worktreeType.value === 'upstream') {
-          // Fetch from upstream with progress
-          await vscode.window.withProgress(
-            {
-              location: vscode.ProgressLocation.Notification,
-              title: 'Fetching from upstream...',
-              cancellable: false,
-            },
-            async () => {
-              gitService.fetchRemote(repo.rootPath, 'upstream');
-            }
+          const fetched = await withCancellableProgress('Fetching from upstream...', (signal) =>
+            gitService.fetchRemote(targetRepo.rootPath, 'upstream', signal)
           );
+          if (!fetched.ok) {
+            vscode.window.showWarningMessage(`Couldn't fetch from upstream: ${fetched.error}. Showing the branches fetched earlier.`);
+          }
 
           // Get upstream branches
-          const upstreamBranches = gitService.getRemoteBranches(repo.rootPath, 'upstream');
+          const upstreamBranches = await gitService.getRemoteBranches(targetRepo.rootPath, 'upstream');
 
           if (upstreamBranches.length === 0) {
             vscode.window.showErrorMessage('No branches found on upstream remote.');
@@ -191,19 +220,7 @@ export function registerWorktreeCommands(
           const newBranchName = await vscode.window.showInputBox({
             prompt: `Enter new branch name (based on ${baseBranch})`,
             placeHolder: 'feature/my-feature',
-            validateInput: (value) => {
-              if (!value || value.trim().length === 0) {
-                return 'Branch name is required';
-              }
-              if (allBranches.includes(value)) {
-                return 'Branch already exists';
-              }
-              // Basic git branch name validation
-              if (!/^[\w\-\/\.]+$/.test(value)) {
-                return 'Invalid branch name. Use only letters, numbers, hyphens, slashes, and dots.';
-              }
-              return undefined;
-            },
+            validateInput: validateNewBranchName,
           });
 
           if (!newBranchName) {
@@ -217,26 +234,22 @@ export function registerWorktreeCommands(
         }
 
         // Determine worktree path (using dedicated worktrees folder)
-        const parentDir = path.dirname(repo.rootPath);
-        const worktreesDir = path.join(parentDir, `${repo.name}-worktrees`);
-        const defaultWorktreePath = path.join(worktreesDir, branchName.replace(/\//g, '-'));
-
-        // Use the default path directly for both existing and new branches
-        const worktreePath = defaultWorktreePath;
+        const parentDir = path.dirname(targetRepo.rootPath);
+        const worktreesDir = path.join(parentDir, `${targetRepo.name}-worktrees`);
+        const worktreePath = path.join(worktreesDir, branchName.replace(/\//g, '-'));
 
         // Create the worktree
-        let success: boolean;
-        if (isNewBranch) {
-          success = gitService.createWorktreeWithNewBranch(repo.rootPath, branchName, worktreePath, baseBranch);
-        } else {
-          success = gitService.createWorktree(repo.rootPath, branchName, worktreePath);
-        }
+        const result = await withProgress(`Creating worktree ${branchName}...`, () =>
+          isNewBranch
+            ? gitService.createWorktreeWithNewBranch(targetRepo.rootPath, branchName, worktreePath, baseBranch)
+            : gitService.createWorktree(targetRepo.rootPath, branchName, worktreePath)
+        );
 
-        if (success) {
+        if (result.ok) {
           vscode.window.showInformationMessage(`Created worktree: ${branchName}`);
           refreshTree();
         } else {
-          vscode.window.showErrorMessage(`Failed to create worktree. Check that the branch exists and path is valid.`);
+          vscode.window.showErrorMessage(`Failed to create worktree: ${result.error}`);
         }
       }
     )
@@ -307,7 +320,7 @@ export function registerWorktreeCommands(
         const worktreePath = worktree.path;
         const currentFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
-        if (currentFolder !== worktreePath) {
+        if (!currentFolder || !samePath(currentFolder, worktreePath)) {
           const folderCount = vscode.workspace.workspaceFolders?.length || 0;
           vscode.workspace.updateWorkspaceFolders(
             0,
@@ -336,59 +349,48 @@ export function registerWorktreeCommands(
           return;
         }
 
-        // Check for uncommitted changes
-        const hasChanges = gitService.hasUncommittedChanges(worktree.path);
-
-        let confirmMessage = `Delete worktree "${worktree.name}"?`;
-
-        if (hasChanges) {
-          confirmMessage += '\n\n⚠️ WARNING: This worktree has uncommitted changes that will be lost!';
-        }
-
-        // Show options: delete worktree only, or delete worktree and branch
-        const deleteWorktreeOnly = hasChanges ? 'Delete Worktree Only (force)' : 'Delete Worktree Only';
-        const deleteWithBranch = hasChanges ? 'Delete Worktree & Branch (force)' : 'Delete Worktree & Branch';
-
-        const confirm = await vscode.window.showWarningMessage(
-          confirmMessage,
-          { modal: true },
-          deleteWorktreeOnly,
-          deleteWithBranch,
-          'Cancel'
-        );
-
-        if (confirm === 'Cancel' || !confirm) {
-          return;
-        }
-
-        const deleteBranch = confirm === deleteWithBranch;
-
-        // Get repo root for the git command
         const repo = storageService.getRepository(worktree.repoId);
         if (!repo) {
           vscode.window.showErrorMessage('Could not find parent repository.');
           return;
         }
 
-        // Attempt to remove the worktree
-        const success = gitService.removeWorktree(repo.rootPath, worktree.path, hasChanges);
+        const hasChanges = await gitService.hasUncommittedChanges(worktree.path);
 
-        if (success) {
-          // If user chose to delete the branch too
-          if (deleteBranch) {
-            const branchDeleted = gitService.deleteBranch(repo.rootPath, worktree.name, true);
-            if (branchDeleted) {
-              vscode.window.showInformationMessage(`Deleted worktree and branch "${worktree.name}"`);
-            } else {
-              vscode.window.showWarningMessage(`Worktree deleted, but failed to delete branch "${worktree.name}". It may be the current branch or have other references.`);
-            }
-          } else {
-            vscode.window.showInformationMessage(`Deleted worktree "${worktree.name}"`);
-          }
-          refreshTree();
-        } else {
-          vscode.window.showErrorMessage(`Failed to delete worktree. Check the Output panel for details.`);
+        const message = [`Delete worktree "${worktree.name}"?`, '', `Folder: ${worktree.path}`];
+        // Only a real branch can be deleted. A detached worktree's name is just its folder
+        // name, and deleting a branch by that name could remove an unrelated branch.
+        message.push(worktree.branch ? `Branch: ${worktree.branch}` : 'HEAD is detached, so there is no branch to delete.');
+        if (hasChanges) {
+          message.push('', '⚠️ WARNING: This worktree has uncommitted changes that will be lost!');
         }
+
+        const deleteWorktreeOnly = hasChanges ? 'Delete Worktree Only (force)' : 'Delete Worktree Only';
+        const deleteWithBranch = hasChanges ? 'Delete Worktree & Branch (force)' : 'Delete Worktree & Branch';
+        const choices = worktree.branch ? [deleteWorktreeOnly, deleteWithBranch] : [deleteWorktreeOnly];
+
+        const confirm = await vscode.window.showWarningMessage(message.join('\n'), { modal: true }, ...choices);
+        if (!confirm) {
+          return;
+        }
+
+        const removed = await withProgress(`Deleting worktree ${worktree.name}...`, () =>
+          gitService.removeWorktree(repo.rootPath, worktree.path, hasChanges)
+        );
+        if (!removed.ok) {
+          vscode.window.showErrorMessage(`Failed to delete worktree: ${removed.error}`);
+          return;
+        }
+
+        // The PR association is keyed by path; don't let it attach to a future worktree there.
+        storageService.removePRWorktree(worktree.id);
+
+        if (confirm === deleteWithBranch && worktree.branch) {
+          await deleteBranchSafely(gitService, repo.rootPath, worktree.branch);
+        } else {
+          vscode.window.showInformationMessage(`Deleted worktree "${worktree.name}"`);
+        }
+        refreshTree();
       }
     )
   );
@@ -411,21 +413,21 @@ export function registerWorktreeCommands(
           return;
         }
 
-        // Get all worktrees in this repository
-        const allWorktrees = gitService.listWorktrees(repo.rootPath, repo.id);
-
-        // Filter out the target worktree (can't merge into itself)
-        const sourceWorktrees = allWorktrees.filter(w => w.id !== targetWorktree.id);
+        // Other worktrees that have a branch checked out (detached ones have nothing to merge by name)
+        const allWorktrees = await gitService.listWorktrees(repo.rootPath, repo.id);
+        const sourceWorktrees = allWorktrees.filter(
+          (w) => w.id !== targetWorktree.id && w.branch && w.branch !== targetWorktree.branch
+        );
 
         if (sourceWorktrees.length === 0) {
-          vscode.window.showInformationMessage('No other worktrees available to merge from.');
+          vscode.window.showInformationMessage('No other worktree branches available to merge from.');
           return;
         }
 
         // Show picker for source branch
         const sourceItems = sourceWorktrees.map(w => ({
-          label: w.name,
-          description: w.isMain ? '(main branch)' : undefined,
+          label: w.branch as string,
+          description: w.isMain ? '(main worktree)' : undefined,
           detail: w.path,
           worktree: w,
         }));
@@ -438,10 +440,10 @@ export function registerWorktreeCommands(
           return;
         }
 
-        const sourceBranch = selected.worktree.name;
+        const sourceBranch = selected.label;
 
         // Check for uncommitted changes in target worktree
-        if (gitService.hasUncommittedChanges(targetWorktree.path)) {
+        if (await gitService.hasUncommittedChanges(targetWorktree.path)) {
           const proceed = await vscode.window.showWarningMessage(
             `"${targetWorktree.name}" has uncommitted changes. Commit or stash them before merging.`,
             'Merge Anyway',
@@ -452,35 +454,48 @@ export function registerWorktreeCommands(
           }
         }
 
-        // Perform the merge
-        const result = gitService.mergeBranch(targetWorktree.path, sourceBranch);
+        const result = await withProgress(`Merging ${sourceBranch} into ${targetWorktree.name}...`, () =>
+          gitService.mergeBranch(targetWorktree.path, sourceBranch)
+        );
 
-        if (result.success) {
+        if (result.ok) {
           vscode.window.showInformationMessage(
             `Successfully merged "${sourceBranch}" into "${targetWorktree.name}"`
           );
           refreshTree();
-        } else {
-          // Check if it's a merge conflict
-          if (result.error?.includes('CONFLICT') || result.error?.includes('conflict')) {
-            vscode.window.showWarningMessage(
-              `Merge conflicts detected. Resolve them in "${targetWorktree.name}" and commit.`,
-              'Open in Terminal'
-            ).then(choice => {
-              if (choice === 'Open in Terminal') {
-                const terminal = vscode.window.createTerminal({
-                  name: `Git: ${targetWorktree.name}`,
-                  cwd: targetWorktree.path,
-                });
-                terminal.show();
-                terminal.sendText('git status');
-              }
-            });
+          return;
+        }
+
+        if (result.conflicts.length === 0) {
+          vscode.window.showErrorMessage(`Failed to merge: ${result.error}`);
+          return;
+        }
+
+        // git leaves the worktree mid-merge: say so, and offer a way out.
+        const shown = result.conflicts.slice(0, 5).join(', ');
+        const more = result.conflicts.length > 5 ? ` and ${result.conflicts.length - 5} more` : '';
+        vscode.commands.executeCommand('agntree.refreshChanges');
+        const choice = await vscode.window.showWarningMessage(
+          `Merging "${sourceBranch}" into "${targetWorktree.name}" stopped with conflicts in ${result.conflicts.length} file(s): ${shown}${more}. ` +
+            'The worktree is now mid-merge: resolve the conflicts and commit, or abort the merge.',
+          'Open Terminal',
+          'Abort Merge'
+        );
+        if (choice === 'Open Terminal') {
+          const terminal = vscode.window.createTerminal({
+            name: `Git: ${targetWorktree.name}`,
+            cwd: targetWorktree.path,
+          });
+          terminal.show();
+          terminal.sendText('git status');
+        } else if (choice === 'Abort Merge') {
+          const aborted = await gitService.abortMerge(targetWorktree.path);
+          if (aborted.ok) {
+            vscode.window.showInformationMessage(`Aborted the merge. "${targetWorktree.name}" is back where it was.`);
           } else {
-            vscode.window.showErrorMessage(
-              `Failed to merge: ${result.error || 'Unknown error'}`
-            );
+            vscode.window.showErrorMessage(`Failed to abort the merge: ${aborted.error}`);
           }
+          vscode.commands.executeCommand('agntree.refreshChanges');
         }
       }
     )
@@ -497,7 +512,7 @@ export function registerWorktreeCommands(
 
         const worktree = item.data as Worktree;
 
-        if (gitService.isRebaseInProgress(worktree.path)) {
+        if (await gitService.isRebaseInProgress(worktree.path)) {
           const choice = await vscode.window.showQuickPick(
             [
               { label: '$(check) Continue', value: 'continue' as const },
@@ -520,37 +535,31 @@ export function registerWorktreeCommands(
         }
 
         // Fetch all remotes and collect branches
-        const remotes = gitService.listRemotes(worktree.path);
+        const remotes = await gitService.listRemotes(worktree.path);
         if (remotes.length === 0) {
           vscode.window.showErrorMessage('No remotes configured for this repository.');
           return;
         }
 
-        const fetchSuccess = await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: 'Fetching remotes...',
-            cancellable: false,
-          },
-          async () => {
-            for (const remote of remotes) {
-              if (!gitService.fetchRemote(worktree.path, remote)) {
-                return false;
-              }
+        const fetchError = await withCancellableProgress('Fetching remotes...', async (signal) => {
+          for (const remote of remotes) {
+            const fetched = await gitService.fetchRemote(worktree.path, remote, signal);
+            if (!fetched.ok) {
+              return fetched.error;
             }
-            return true;
           }
-        );
+          return undefined;
+        });
 
-        if (!fetchSuccess) {
-          vscode.window.showErrorMessage('Failed to fetch from remotes. Check your network or credentials.');
+        if (fetchError) {
+          vscode.window.showErrorMessage(`Failed to fetch from remotes: ${fetchError}`);
           return;
         }
 
         // Collect all remote branches
         const allBranches: string[] = [];
         for (const remote of remotes) {
-          allBranches.push(...gitService.getRemoteBranches(worktree.path, remote));
+          allBranches.push(...(await gitService.getRemoteBranches(worktree.path, remote)));
         }
 
         if (allBranches.length === 0) {
@@ -559,8 +568,8 @@ export function registerWorktreeCommands(
         }
 
         // Detect recommended branch (upstream/main > upstream/master > origin/main > origin/master)
-        const recommended = gitService.getRebaseRemote(worktree.path);
-        const currentBranch = gitService.getCurrentBranch(worktree.path);
+        const recommended = await gitService.getRecommendedRebaseTarget(worktree.path);
+        const currentBranch = worktree.branch ?? (await gitService.getCurrentBranch(worktree.path));
 
         // Build QuickPick items with recommended at top
         const branchItems = allBranches
@@ -588,25 +597,29 @@ export function registerWorktreeCommands(
 
         const targetBranch = selectedBranch.branch;
 
-        if (gitService.isUpToDate(worktree.path, targetBranch)) {
+        if (await gitService.isUpToDate(worktree.path, targetBranch)) {
           vscode.window.showInformationMessage(
             `"${worktree.name}" is already up to date with ${targetBranch}.`
           );
           return;
         }
 
-        const conflictCheck = gitService.checkRebaseConflicts(worktree.path, targetBranch);
-        const stagedCount = gitService.getStagedChanges(worktree.path).length;
-        const unstagedCount = gitService.getUnstagedChanges(worktree.path).length;
+        const [conflictCheck, status] = await Promise.all([
+          gitService.checkRebaseConflicts(worktree.path, targetBranch),
+          gitService.getStatus(worktree.path),
+        ]);
+        const changeCount = status.staged.length + status.unstaged.length;
 
         const details: string[] = [];
-        if (conflictCheck.hasConflicts) {
+        if (!conflictCheck.checked) {
+          details.push('Conflict check unavailable (needs git 2.38+)');
+        } else if (conflictCheck.hasConflicts) {
           details.push(`${conflictCheck.conflictingFiles.length} conflicting file(s): ${conflictCheck.conflictingFiles.join(', ')}`);
         } else {
           details.push('No conflicts detected');
         }
-        if (stagedCount + unstagedCount > 0) {
-          details.push(`${stagedCount + unstagedCount} uncommitted change(s) will be auto-stashed`);
+        if (changeCount > 0) {
+          details.push(`${changeCount} uncommitted change(s) will be auto-stashed`);
         }
 
         const proceed = await vscode.window.showQuickPick(
@@ -629,30 +642,21 @@ export function registerWorktreeCommands(
           return;
         }
 
-        const result = await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: `Rebasing ${worktree.name} onto ${targetBranch}...`,
-            cancellable: false,
-          },
-          async () => gitService.rebase(worktree.path, targetBranch)
+        const result = await withProgress(`Rebasing ${worktree.name} onto ${targetBranch}...`, () =>
+          gitService.rebase(worktree.path, targetBranch)
         );
 
-        if (result.success) {
+        if (result.ok) {
           vscode.window.showInformationMessage(
             `Successfully rebased "${worktree.name}" onto ${targetBranch}`
           );
           refreshTree();
+        } else if (await gitService.isRebaseInProgress(worktree.path)) {
+          vscode.window.showWarningMessage(
+            'Rebase paused due to conflicts. Resolve conflicts and use the rebase controls in the Changes panel.'
+          );
         } else {
-          if (gitService.isRebaseInProgress(worktree.path)) {
-            vscode.window.showWarningMessage(
-              'Rebase paused due to conflicts. Resolve conflicts and use the rebase controls in the Changes panel.'
-            );
-          } else {
-            vscode.window.showErrorMessage(
-              `Rebase failed: ${result.error || 'Unknown error'}`
-            );
-          }
+          vscode.window.showErrorMessage(`Rebase failed: ${result.error}`);
         }
 
         vscode.commands.executeCommand('agntree.refreshChanges');
@@ -712,6 +716,7 @@ export function registerWorktreeCommands(
 
           repo = selected.repo;
         }
+        const targetRepo = repo;
 
         const githubService = new GitHubService();
 
@@ -721,14 +726,7 @@ export function registerWorktreeCommands(
         }
 
         // Fetch open PRs with progress
-        const prs = await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: 'Fetching open PRs...',
-            cancellable: false,
-          },
-          () => githubService.listPRs(repo.rootPath)
-        );
+        const prs = await withProgress('Fetching open PRs...', () => githubService.listPRs(targetRepo.rootPath));
 
         // Build QuickPick items
         const manualEntry = {
@@ -737,6 +735,7 @@ export function registerWorktreeCommands(
           detail: '',
           prNumber: -1,
           branchName: '',
+          url: '',
         };
 
         const prItems = prs.map((pr) => ({
@@ -745,6 +744,7 @@ export function registerWorktreeCommands(
           detail: pr.isDraft ? 'Draft' : '',
           prNumber: pr.number,
           branchName: pr.headRefName || '',
+          url: pr.url,
         }));
 
         const items = [manualEntry, ...prItems];
@@ -764,6 +764,7 @@ export function registerWorktreeCommands(
 
         let prNumber: number;
         let branchName: string;
+        let prUrl: string;
 
         if (selected.prNumber === -1) {
           // Manual entry
@@ -782,13 +783,8 @@ export function registerWorktreeCommands(
             return;
           }
 
-          const prDetails = await vscode.window.withProgress(
-            {
-              location: vscode.ProgressLocation.Notification,
-              title: 'Fetching PR details...',
-              cancellable: false,
-            },
-            () => githubService.fetchPRDetails(repo.rootPath, input.trim())
+          const prDetails = await withProgress('Fetching PR details...', () =>
+            githubService.fetchPRDetails(targetRepo.rootPath, input.trim())
           );
 
           if (!prDetails) {
@@ -803,48 +799,62 @@ export function registerWorktreeCommands(
 
           prNumber = prDetails.number;
           branchName = prDetails.headRefName;
+          prUrl = prDetails.url;
         } else {
           prNumber = selected.prNumber;
           branchName = selected.branchName;
+          prUrl = selected.url;
         }
 
         // Use pr-<number> as the local branch name to avoid collisions
         const localBranch = `pr-${prNumber}`;
 
         // Check if this PR already has a worktree
-        const existingWorktrees = gitService.listWorktrees(repo.rootPath, repo.id);
-        const existing = existingWorktrees.find(w => w.name === localBranch);
-
-        if (existing) {
+        const existingWorktrees = await gitService.listWorktrees(targetRepo.rootPath, targetRepo.id);
+        if (existingWorktrees.some((w) => w.branch === localBranch)) {
           vscode.window.showInformationMessage(`PR #${prNumber} already has a worktree.`);
           return;
         }
 
-        // Fetch the PR and create worktree with progress
-        const success = await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: `Checking out PR #${prNumber}...`,
-            cancellable: false,
-          },
-          async () => {
-            const fetched = gitService.fetchPR(repo.rootPath, prNumber, localBranch);
-            if (!fetched) {
-              return false;
-            }
-
-            const parentDir = path.dirname(repo.rootPath);
-            const worktreesDir = path.join(parentDir, `${repo.name}-worktrees`);
-            const worktreePath = path.join(worktreesDir, branchName.replace(/\//g, '-'));
-
-            return gitService.createWorktree(repo.rootPath, localBranch, worktreePath);
+        // Fetch refs/pull/<n>/head from the PR's repository. This never checks anything
+        // out, so the main worktree (and anything running in it) is left alone.
+        const location = parsePullRequestUrl(prUrl);
+        if (!location) {
+          vscode.window.showErrorMessage(`Could not tell which repository PR #${prNumber} belongs to (URL: ${prUrl || 'none'}).`);
+          return;
+        }
+        const remotes = await gitService.listRemoteUrls(targetRepo.rootPath);
+        let source = findRemoteForPullRequest(remotes, location);
+        if (!source) {
+          const repoUrl = pullRequestRepoUrl(location);
+          const choice = await vscode.window.showWarningMessage(
+            `PR #${prNumber} is in ${location.owner}/${location.repo}, which isn't a remote of this repository.\n\nFetch it from ${repoUrl} anyway?`,
+            { modal: true },
+            'Fetch'
+          );
+          if (choice !== 'Fetch') {
+            return;
           }
-        );
+          source = repoUrl;
+        }
+        const fetchSource = source;
 
-        if (success) {
+        const parentDir = path.dirname(targetRepo.rootPath);
+        const worktreesDir = path.join(parentDir, `${targetRepo.name}-worktrees`);
+        const worktreePath = path.join(worktreesDir, branchName.replace(/\//g, '-'));
+
+        const outcome = await withCancellableProgress(`Checking out PR #${prNumber}...`, async (signal) => {
+          const fetched = await gitService.fetchPullRequest(targetRepo.rootPath, prNumber, localBranch, fetchSource, signal);
+          if (!fetched.ok) {
+            return fetched;
+          }
+          return gitService.createWorktree(targetRepo.rootPath, localBranch, worktreePath);
+        });
+
+        if (outcome.ok) {
           // Store PR association for the new worktree
-          const worktrees = gitService.listWorktrees(repo.rootPath, repo.id);
-          const newWorktree = worktrees.find(w => w.name === localBranch);
+          const worktrees = await gitService.listWorktrees(targetRepo.rootPath, targetRepo.id);
+          const newWorktree = worktrees.find((w) => w.branch === localBranch);
           if (newWorktree) {
             storageService.setPRWorktree(newWorktree.id, prNumber);
           }
@@ -852,7 +862,7 @@ export function registerWorktreeCommands(
           vscode.window.showInformationMessage(`Checked out PR #${prNumber}: ${branchName}`);
           refreshTree();
         } else {
-          vscode.window.showErrorMessage(`Failed to checkout PR #${prNumber}. The PR may not exist or fetching from the remote failed.`);
+          vscode.window.showErrorMessage(`Failed to check out PR #${prNumber}: ${outcome.error}`);
         }
       }
     )

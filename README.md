@@ -229,7 +229,7 @@ The **Quick Actions** panel lets you run commands with one click:
 - **Commit** — Runs Claude with a commit prompt
 - **Git Status** — Runs `git status` command
 
-**Configuration** (Settings → `agntree.quickActions`):
+**Configuration** (Settings → `agntree.quickActions`, in your **user** settings). Quick actions can't be defined in a repository's `.vscode/settings.json`, so a cloned repo or a checked-out PR can't add commands to this panel.
 
 ```json
 {

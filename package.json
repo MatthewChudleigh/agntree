@@ -397,7 +397,8 @@
       {
         "command": "agntree.showStarredSessions",
         "key": "ctrl+shift+s",
-        "mac": "cmd+shift+s"
+        "mac": "cmd+shift+s",
+        "when": "focusedView == agntree.workspacesView"
       }
     ],
     "configuration": {
@@ -415,6 +416,8 @@
         },
         "agntree.quickActions": {
           "type": "array",
+          "scope": "application",
+          "markdownDescription": "Custom quick actions. Use `prompt` + `allowedTools` for Claude headless mode, or `command` for any shell command.\n\nCan only be set in your user settings, so a repository's `.vscode/settings.json` can't add commands to this panel.",
           "default": [
             {
               "name": "Commit",
@@ -428,7 +431,6 @@
               "command": "git status"
             }
           ],
-          "description": "Custom quick actions. Use 'prompt' + 'allowedTools' for Claude headless mode, or 'command' for any shell command.",
           "items": {
             "type": "object",
             "properties": {
@@ -774,6 +776,16 @@
         },
         {
           "command": "agntree.stageFile",
+          "when": "view == agntree.changesView && viewItem == conflictedFile",
+          "group": "inline@1"
+        },
+        {
+          "command": "agntree.stageFile",
+          "when": "view == agntree.changesView && viewItem == conflictedFile",
+          "group": "navigation"
+        },
+        {
+          "command": "agntree.stageFile",
           "when": "view == agntree.changesView && viewItem == unstagedFile",
           "group": "navigation"
         },
@@ -854,6 +866,8 @@
     "vscode:prepublish": "npm run compile",
     "compile": "node esbuild.js",
     "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit -p .",
+    "test": "npm run typecheck && node scripts/test.js",
     "lint": "eslint src --ext ts"
   },
   "devDependencies": {

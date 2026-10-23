@@ -4,6 +4,7 @@ import { StorageService } from '../services/StorageService';
 import { GitService } from '../services/GitService';
 import { WorkspaceTreeItem } from '../providers/WorkspacesTreeProvider';
 import { Repository } from '../types';
+import { withCancellableProgress } from '../utils/progress';
 
 /**
  * Register repository-related commands
@@ -32,7 +33,7 @@ export function registerRepositoryCommands(
       const folderPath = folders[0].fsPath;
 
       // Check if it's a git repository
-      if (!gitService.isGitRepository(folderPath)) {
+      if (!(await gitService.isGitRepository(folderPath))) {
         vscode.window.showErrorMessage(
           'The selected folder is not a git repository. Please select a folder containing a .git directory.'
         );
@@ -40,7 +41,7 @@ export function registerRepositoryCommands(
       }
 
       // Get the repo root (in case they selected a subdirectory)
-      const repoRoot = gitService.getRepoRoot(folderPath);
+      const repoRoot = await gitService.getRepoRoot(folderPath);
       if (!repoRoot) {
         vscode.window.showErrorMessage('Could not determine the repository root.');
         return;
@@ -166,32 +167,20 @@ export function registerRepositoryCommands(
       const parentPath = folders[0].fsPath;
       const clonePath = path.join(parentPath, repoName);
 
-      // Clone the repository
-      try {
-        await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: `Cloning ${repoName}...`,
-            cancellable: false,
-          },
-          async () => {
-            // execFile with an argument array — never interpolate the URL/path into a shell string.
-            const { execFileSync } = require('child_process');
-            execFileSync('git', ['clone', normalizedUrl, clonePath], {
-              encoding: 'utf-8',
-              stdio: ['pipe', 'pipe', 'pipe'],
-            });
-          }
-        );
+      // Clone the repository (async and cancellable: a large clone can take minutes)
+      const result = await withCancellableProgress(`Cloning ${repoName}...`, (signal) =>
+        gitService.clone(normalizedUrl, clonePath, signal)
+      );
 
-        // Add to extension
-        const repo = storageService.addRepository(repoName, clonePath);
-        vscode.window.showInformationMessage(`Cloned and added repository: ${repo.name}`);
-        refreshTree();
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        vscode.window.showErrorMessage(`Failed to clone repository: ${errorMessage}`);
+      if (!result.ok) {
+        vscode.window.showErrorMessage(`Failed to clone repository: ${result.error}`);
+        return;
       }
+
+      // Add to extension
+      const repo = storageService.addRepository(repoName, clonePath);
+      vscode.window.showInformationMessage(`Cloned and added repository: ${repo.name}`);
+      refreshTree();
     })
   );
 }

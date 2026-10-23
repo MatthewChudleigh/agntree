@@ -1,6 +1,48 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { FileTreeItem, FilesTreeProvider } from '../providers/FilesTreeProvider';
+import { resolveNewEntryPath, samePath } from '../utils/paths';
+
+async function pathExists(uri: vscode.Uri): Promise<boolean> {
+  try {
+    await vscode.workspace.fs.stat(uri);
+    return true;
+  } catch (err) {
+    // Anything other than "not found" (e.g. permissions) counts as taken, to be safe.
+    return !(err instanceof vscode.FileSystemError && err.code === 'FileNotFound');
+  }
+}
+
+/**
+ * Input box validation for a new file/folder name: it must stay inside the worktree
+ * and must not already exist. `workspace.fs.writeFile` overwrites, so without the
+ * existence check "New File" with an existing name would silently empty that file.
+ * `ignorePath` is the entry being renamed, so a case-only rename isn't refused.
+ */
+function validateNewEntryName(rootDir: string, parentDir: string, ignorePath?: string) {
+  return async (value: string): Promise<string | undefined> => {
+    const resolved = resolveNewEntryPath(rootDir, parentDir, value);
+    if (!resolved.ok) {
+      return resolved.error;
+    }
+    if (ignorePath && samePath(resolved.path, ignorePath)) {
+      return undefined;
+    }
+    if (await pathExists(vscode.Uri.file(resolved.path))) {
+      return `"${value}" already exists.`;
+    }
+    return undefined;
+  };
+}
+
+/** The folder a new entry goes in: the selected folder, a selected file's folder, or the worktree root. */
+function targetFolder(item: FileTreeItem | undefined, rootDir: string): string {
+  if (!item) {
+    return rootDir;
+  }
+  const isFolder = (item.fileType & vscode.FileType.Directory) !== 0;
+  return isFolder ? item.uri.fsPath : path.dirname(item.uri.fsPath);
+}
 
 async function uniqueDestUri(targetDirUri: vscode.Uri, sourceUri: vscode.Uri): Promise<vscode.Uri> {
   const name = path.basename(sourceUri.fsPath);
@@ -70,15 +112,23 @@ export function registerFileCommands(
       const isFolder = (item.fileType & vscode.FileType.Directory) !== 0;
       const dotIndex = oldName.lastIndexOf('.');
       const selectionEnd = (!isFolder && dotIndex > 0) ? dotIndex : oldName.length;
+      const parentDir = path.dirname(item.uri.fsPath);
+      const rootDir = filesProvider.getActiveWorktree()?.path ?? parentDir;
 
       const newName = await vscode.window.showInputBox({
         prompt: 'Enter new name',
         value: oldName,
         valueSelection: [0, selectionEnd],
+        validateInput: validateNewEntryName(rootDir, parentDir, item.uri.fsPath),
       });
       if (!newName || newName === oldName) { return; }
 
-      const newUri = vscode.Uri.joinPath(vscode.Uri.file(path.dirname(item.uri.fsPath)), newName);
+      const resolved = resolveNewEntryPath(rootDir, parentDir, newName);
+      if (!resolved.ok) {
+        vscode.window.showErrorMessage(resolved.error);
+        return;
+      }
+      const newUri = vscode.Uri.file(resolved.path);
       try {
         await vscode.workspace.fs.rename(item.uri, newUri, { overwrite: false });
         filesProvider.refresh();
@@ -107,10 +157,23 @@ export function registerFileCommands(
     vscode.commands.registerCommand('agntree.files.newFile', async (item?: FileTreeItem) => {
       const worktree = filesProvider.getActiveWorktree();
       if (!worktree) { return; }
-      const parentPath = item ? item.uri.fsPath : worktree.path;
-      const name = await vscode.window.showInputBox({ prompt: 'File name' });
+      const parentPath = targetFolder(item, worktree.path);
+      const name = await vscode.window.showInputBox({
+        prompt: 'File name',
+        validateInput: validateNewEntryName(worktree.path, parentPath),
+      });
       if (!name) { return; }
-      const newUri = vscode.Uri.joinPath(vscode.Uri.file(parentPath), name);
+      const resolved = resolveNewEntryPath(worktree.path, parentPath, name);
+      if (!resolved.ok) {
+        vscode.window.showErrorMessage(resolved.error);
+        return;
+      }
+      const newUri = vscode.Uri.file(resolved.path);
+      // Check again right before writing: writeFile would replace an existing file's contents.
+      if (await pathExists(newUri)) {
+        vscode.window.showErrorMessage(`"${name}" already exists.`);
+        return;
+      }
       try {
         await vscode.workspace.fs.writeFile(newUri, new Uint8Array());
         filesProvider.refresh();
@@ -123,10 +186,22 @@ export function registerFileCommands(
     vscode.commands.registerCommand('agntree.files.newFolder', async (item?: FileTreeItem) => {
       const worktree = filesProvider.getActiveWorktree();
       if (!worktree) { return; }
-      const parentPath = item ? item.uri.fsPath : worktree.path;
-      const name = await vscode.window.showInputBox({ prompt: 'Folder name' });
+      const parentPath = targetFolder(item, worktree.path);
+      const name = await vscode.window.showInputBox({
+        prompt: 'Folder name',
+        validateInput: validateNewEntryName(worktree.path, parentPath),
+      });
       if (!name) { return; }
-      const newUri = vscode.Uri.joinPath(vscode.Uri.file(parentPath), name);
+      const resolved = resolveNewEntryPath(worktree.path, parentPath, name);
+      if (!resolved.ok) {
+        vscode.window.showErrorMessage(resolved.error);
+        return;
+      }
+      const newUri = vscode.Uri.file(resolved.path);
+      if (await pathExists(newUri)) {
+        vscode.window.showErrorMessage(`"${name}" already exists.`);
+        return;
+      }
       try {
         await vscode.workspace.fs.createDirectory(newUri);
         filesProvider.refresh();

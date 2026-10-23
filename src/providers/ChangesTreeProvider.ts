@@ -1,27 +1,27 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { FileChange, Worktree } from '../types';
-import { StorageService } from '../services/StorageService';
 import { GitService } from '../services/GitService';
 
 /**
- * Section header for staged/unstaged changes
+ * Section header for staged/unstaged changes. Holds its own file list, so a refresh
+ * that overlaps an earlier one can't mix up their results.
  */
 export class ChangeSectionItem extends vscode.TreeItem {
   constructor(
     label: string,
     public readonly sectionType: 'staged' | 'unstaged',
     public readonly worktreePath: string,
-    fileCount: number,
-    totalAdditions: number,
-    totalDeletions: number
+    public readonly changes: FileChange[]
   ) {
     super(label, vscode.TreeItemCollapsibleState.Expanded);
 
+    const totalAdditions = changes.reduce((sum, c) => sum + c.additions, 0);
+    const totalDeletions = changes.reduce((sum, c) => sum + c.deletions, 0);
     const additions = totalAdditions > 0 ? `+${totalAdditions}` : '';
     const deletions = totalDeletions > 0 ? `-${totalDeletions}` : '';
     const stats = [additions, deletions].filter(Boolean).join(' ');
-    this.description = `${fileCount} file(s)${stats ? ` ${stats}` : ''}`;
+    this.description = `${changes.length} file(s)${stats ? ` ${stats}` : ''}`;
 
     this.iconPath = new vscode.ThemeIcon(
       sectionType === 'staged' ? 'check' : 'edit'
@@ -66,17 +66,18 @@ export class ChangeTreeItem extends vscode.TreeItem {
     this.resourceUri = vscode.Uri.file(fullPath);
 
     // Status letter and line counts in description (like Source Control)
-    const statusLetter = this.getStatusLetter(change.status);
+    const statusLetter = ChangeTreeItem.statusLetter(change.status);
     const additions = change.additions > 0 ? `+${change.additions}` : '';
     const deletions = change.deletions > 0 ? `-${change.deletions}` : '';
     const lineCounts = [additions, deletions].filter(Boolean).join(' ');
     this.description = lineCounts ? `${statusLetter} ${lineCounts}` : statusLetter;
 
     // Set tooltip
-    this.tooltip = `${change.path}\n${change.status}\n${additions} ${deletions}`.trim();
+    const shownPath = change.origPath ? `${change.origPath} → ${change.path}` : change.path;
+    this.tooltip = `${shownPath}\n${change.status}\n${additions} ${deletions}`.trim();
 
-    // Set context value for menus (different for staged vs unstaged)
-    this.contextValue = isStaged ? 'stagedFile' : 'unstagedFile';
+    // Set context value for menus (different for staged, unstaged, and conflicted)
+    this.contextValue = isStaged ? 'stagedFile' : change.status === 'conflicted' ? 'conflictedFile' : 'unstagedFile';
 
     // Make clickable to open diff
     this.command = {
@@ -86,7 +87,8 @@ export class ChangeTreeItem extends vscode.TreeItem {
     };
   }
 
-  private getStatusLetter(status: FileChange['status']): string {
+  /** Letters match VS Code's Source Control view. */
+  private static statusLetter(status: FileChange['status']): string {
     switch (status) {
       case 'added':
         return 'A';
@@ -96,6 +98,10 @@ export class ChangeTreeItem extends vscode.TreeItem {
         return 'D';
       case 'renamed':
         return 'R';
+      case 'untracked':
+        return 'U';
+      case 'conflicted':
+        return '!';
       default:
         return '?';
     }
@@ -118,15 +124,7 @@ export class ChangesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
   /** Debounce timer for refresh */
   private refreshTimer: NodeJS.Timeout | undefined;
 
-  /** Cached data for getChildren calls */
-  private stagedChanges: FileChange[] = [];
-  private unstagedChanges: FileChange[] = [];
-
-  constructor(
-    private storageService: StorageService,
-    private gitService: GitService,
-    private getWorktreeById: (id: string) => Worktree | undefined
-  ) {}
+  constructor(private gitService: GitService) {}
 
   /**
    * Set the active worktree to display changes for
@@ -140,10 +138,8 @@ export class ChangesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
   /**
    * Set the active chat to display changes for (uses chat's worktree)
    */
-  setActiveChat(chatId: string | undefined, worktree?: Worktree): void {
-    this.activeWorktree = worktree;
-    this.setupFileWatcher();
-    this.refresh();
+  setActiveChat(_chatId: string | undefined, worktree?: Worktree): void {
+    this.setActiveWorktree(worktree);
   }
 
   /**
@@ -167,7 +163,7 @@ export class ChangesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
       return;
     }
 
-    // Watch all files in the worktree (excluding .git and node_modules)
+    // Watch all files in the worktree
     const pattern = new vscode.RelativePattern(
       this.activeWorktree.path,
       '**/*'
@@ -220,88 +216,68 @@ export class ChangesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
       return [this.createPlaceholderItem('Select a worktree or chat to view changes')];
     }
 
-    const worktree = this.activeWorktree;
-
     // If element is a changes section, return its file children
     if (element instanceof ChangeSectionItem) {
-      const changes = element.sectionType === 'staged'
-        ? this.stagedChanges
-        : this.unstagedChanges;
+      return this.createFileItems(element.changes, element.worktreePath, element.sectionType === 'staged');
+    }
 
-      return this.createFileItems(changes, worktree.path, element.sectionType === 'staged');
+    if (element) {
+      return [];
     }
 
     // Root level - show sections
-    if (!element) {
-      // Fetch fresh data
-      this.stagedChanges = this.gitService.getStagedChanges(worktree.path);
-      this.unstagedChanges = this.gitService.getUnstagedChanges(worktree.path);
+    const worktree = this.activeWorktree;
+    const [status, rebaseInProgress] = await Promise.all([
+      this.gitService.getStatus(worktree.path),
+      this.gitService.isRebaseInProgress(worktree.path),
+    ]);
 
-      const items: vscode.TreeItem[] = [];
+    // The selection changed while git was running; the refresh for the new worktree replaces this one.
+    if (this.activeWorktree !== worktree) {
+      return [];
+    }
 
-      // Check for rebase in progress
-      const rebaseInProgress = this.gitService.isRebaseInProgress(worktree.path);
-      vscode.commands.executeCommand('setContext', 'agntree.rebaseInProgress', rebaseInProgress);
-      if (rebaseInProgress) {
-        const progress = this.gitService.getRebaseProgress(worktree.path);
-        items.push(new RebaseSectionItem(
-          worktree.path,
-          progress?.current ?? 1,
-          progress?.total ?? 1
-        ));
-      }
+    const items: vscode.TreeItem[] = [];
 
-      // Update context for commit button visibility
-      const hasChanges = this.stagedChanges.length > 0 || this.unstagedChanges.length > 0;
-      vscode.commands.executeCommand('setContext', 'agntree.hasChanges', hasChanges);
+    vscode.commands.executeCommand('setContext', 'agntree.rebaseInProgress', rebaseInProgress);
+    if (rebaseInProgress) {
+      const progress = await this.gitService.getRebaseProgress(worktree.path);
+      items.push(new RebaseSectionItem(
+        worktree.path,
+        progress?.current ?? 1,
+        progress?.total ?? 1
+      ));
+    }
 
-      // No changes message
-      if (!hasChanges && !rebaseInProgress) {
-        items.push(this.createPlaceholderItem('No changes detected'));
-        return items;
-      }
+    const hasChanges = status.staged.length > 0 || status.unstaged.length > 0;
+    vscode.commands.executeCommand('setContext', 'agntree.hasChanges', hasChanges);
 
-      // Staged Changes section
-      if (this.stagedChanges.length > 0) {
-        const stagedAdditions = this.stagedChanges.reduce((sum, c) => sum + c.additions, 0);
-        const stagedDeletions = this.stagedChanges.reduce((sum, c) => sum + c.deletions, 0);
-        items.push(new ChangeSectionItem(
-          'Staged Changes',
-          'staged',
-          worktree.path,
-          this.stagedChanges.length,
-          stagedAdditions,
-          stagedDeletions
-        ));
-      }
-
-      // Unstaged Changes section
-      if (this.unstagedChanges.length > 0) {
-        const unstagedAdditions = this.unstagedChanges.reduce((sum, c) => sum + c.additions, 0);
-        const unstagedDeletions = this.unstagedChanges.reduce((sum, c) => sum + c.deletions, 0);
-        items.push(new ChangeSectionItem(
-          'Changes',
-          'unstaged',
-          worktree.path,
-          this.unstagedChanges.length,
-          unstagedAdditions,
-          unstagedDeletions
-        ));
-      }
-
+    // No changes message
+    if (!hasChanges && !rebaseInProgress) {
+      items.push(this.createPlaceholderItem('No changes detected'));
       return items;
     }
 
-    return [];
+    if (status.staged.length > 0) {
+      items.push(new ChangeSectionItem('Staged Changes', 'staged', worktree.path, status.staged));
+    }
+
+    if (status.unstaged.length > 0) {
+      items.push(new ChangeSectionItem('Changes', 'unstaged', worktree.path, status.unstaged));
+    }
+
+    return items;
   }
 
   /**
    * Create tree items for file changes
    */
   private createFileItems(changes: FileChange[], worktreePath: string, isStaged: boolean): vscode.TreeItem[] {
-    // Sort changes: added first, then modified, then deleted
+    // Sort changes: conflicts first, then added, modified, renamed, deleted
     const statusOrder: Record<FileChange['status'], number> = {
+      conflicted: -1,
       added: 0,
+      untracked: 0,
       modified: 1,
       renamed: 2,
       deleted: 3,
@@ -309,7 +285,7 @@ export class ChangesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
     const sorted = [...changes].sort((a, b) => statusOrder[a.status] - statusOrder[b.status]);
 
     return sorted.map(change => new ChangeTreeItem(
-      path.basename(change.path),
+      path.basename(change.path.replace(/\/$/, '')),
       change,
       worktreePath,
       null,

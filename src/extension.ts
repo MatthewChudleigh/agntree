@@ -12,6 +12,7 @@ import { registerWorktreeCommands } from './commands/worktree';
 import { registerChatCommands } from './commands/chat';
 import { registerQuickActionCommands } from './commands/quickActions';
 import { registerFileCommands } from './commands/files';
+import { samePath } from './utils/paths';
 
 /**
  * Extension activation
@@ -38,11 +39,7 @@ export function activate(context: vscode.ExtensionContext) {
     terminalManager
   );
 
-  const changesProvider = new ChangesTreeProvider(
-    storageService,
-    gitService,
-    (id) => workspacesProvider.getWorktreeById(id)
-  );
+  const changesProvider = new ChangesTreeProvider(gitService);
 
   const quickActionsProvider = new QuickActionsTreeProvider();
   const filesProvider = new FilesTreeProvider();
@@ -165,37 +162,39 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // On activation, expand only the worktree matching the current VS Code workspace folder
+  // On activation, expand only the worktree matching the current VS Code workspace folder.
+  // Runs in the background so git never delays activation.
   const currentFolderPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  const activeWorktree = currentFolderPath
-    ? workspacesProvider.findWorktreeByPath(currentFolderPath)
-    : undefined;
+  if (currentFolderPath) {
+    workspacesProvider.findWorktreeByPath(currentFolderPath).then((activeWorktree) => {
+      if (!activeWorktree) {
+        return;
+      }
+      changesProvider.setActiveWorktree(activeWorktree);
+      filesProvider.setActiveWorktree(activeWorktree);
+      quickActionsProvider.setActiveWorktreePath(activeWorktree.path);
+      updateViewTitles(activeWorktree);
+      storageService.setActiveWorktreeId(activeWorktree.id);
 
-  if (activeWorktree) {
-    changesProvider.setActiveWorktree(activeWorktree);
-    filesProvider.setActiveWorktree(activeWorktree);
-    quickActionsProvider.setActiveWorktreePath(activeWorktree.path);
-    updateViewTitles(activeWorktree);
-    storageService.setActiveWorktreeId(activeWorktree.id);
+      const revealActive = () => {
+        const item = workspacesProvider.getWorktreeTreeItem(activeWorktree);
+        workspacesTreeView.reveal(item, { select: true, focus: false, expand: true });
+      };
 
-    const revealActive = () => {
-      const item = workspacesProvider.getWorktreeTreeItem(activeWorktree);
-      workspacesTreeView.reveal(item, { select: true, focus: false, expand: true });
-    };
-
-    if (workspacesTreeView.visible) {
-      setTimeout(revealActive, 100);
-    } else {
-      const d = workspacesTreeView.onDidChangeVisibility((e) => {
-        if (e.visible) { d.dispose(); setTimeout(revealActive, 100); }
-      });
-      context.subscriptions.push(d);
-    }
+      if (workspacesTreeView.visible) {
+        setTimeout(revealActive, 100);
+      } else {
+        const d = workspacesTreeView.onDidChangeVisibility((e) => {
+          if (e.visible) { d.dispose(); setTimeout(revealActive, 100); }
+        });
+        context.subscriptions.push(d);
+      }
+    }, (error) => console.error('Failed to find the active worktree:', error));
   }
 
   // Listen for tree view selection changes to update changes view and switch workspace
   context.subscriptions.push(
-    workspacesTreeView.onDidChangeSelection((event) => {
+    workspacesTreeView.onDidChangeSelection(async (event) => {
       if (event.selection.length > 0) {
         const selected = event.selection[0];
         let worktree: import('./types').Worktree | undefined;
@@ -206,8 +205,12 @@ export function activate(context: vscode.ExtensionContext) {
         } else if (selected.itemType === 'chat') {
           // Chat selected - show parent worktree's changes
           const chat = selected.data as import('./types').ChatSession;
-          worktree = workspacesProvider.getWorktreeById(chat.worktreeId);
           storageService.setActiveChatId(chat.id);
+          worktree = await workspacesProvider.getWorktreeById(chat.worktreeId);
+          // Ignore the result if the selection moved on while git was running.
+          if (workspacesTreeView.selection[0] !== selected) {
+            return;
+          }
         }
 
         if (!worktree) {
@@ -235,7 +238,7 @@ export function activate(context: vscode.ExtensionContext) {
           const worktreePath = worktree.path;
           const currentFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
-          if (currentFolder !== worktreePath) {
+          if (!currentFolder || !samePath(currentFolder, worktreePath)) {
             const folderCount = vscode.workspace.workspaceFolders?.length || 0;
             vscode.workspace.updateWorkspaceFolders(
               0,           // Start at index 0
@@ -252,7 +255,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Listen for terminal focus changes to select corresponding chat in tree
   context.subscriptions.push(
-    vscode.window.onDidChangeActiveTerminal((terminal) => {
+    vscode.window.onDidChangeActiveTerminal(async (terminal) => {
       if (!terminal) return;
 
       // Parse the chat ID from the terminal name
@@ -268,7 +271,7 @@ export function activate(context: vscode.ExtensionContext) {
           storageService.setActiveChatId(chat.id);
           storageService.setActiveWorktreeId(chat.worktreeId);
 
-          const worktree = workspacesProvider.getWorktreeById(chat.worktreeId);
+          const worktree = await workspacesProvider.getWorktreeById(chat.worktreeId);
           if (worktree) {
             changesProvider.setActiveWorktree(worktree);
             filesProvider.setActiveWorktree(worktree);

@@ -50,7 +50,8 @@ build:
     expire_in: 1 week
 
 # A version is published once. Workspaces pin it, so replacing its file would change every new
-# workspace without a template change; bump the version instead.
+# workspace without a template change; bump the version instead. One block, so the header's
+# "JOB-TOKEN: ..." stays shell text (unquoted in a YAML list, ": " would make the line a mapping).
 publish:
   stage: publish
   needs:
@@ -58,11 +59,19 @@ publish:
   rules:
     - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
   script:
-    - version="${CI_COMMIT_TAG#v}"
-    - file="agntree-$version.vsix"
-    - test -f "$file" || { echo "The build made no $file. Does package.json say version $version?"; exit 1; }
-    - url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/agntree/$version/$file"
-    - status=$(curl -sS -o /dev/null -w '%{http_code}' --header "JOB-TOKEN: $CI_JOB_TOKEN" "$url")
-    - if [ "$status" = 200 ]; then echo "agntree $version is already published"; exit 1; fi
-    - curl -fsS --retry 3 --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$file" "$url"
-    - echo "Published $url"
+    - |
+      set -euo pipefail
+      version="${CI_COMMIT_TAG#v}"
+      file="agntree-$version.vsix"
+      if [ ! -f "$file" ]; then
+        echo "The build made no $file. Does package.json say version $version?"
+        exit 1
+      fi
+      url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/agntree/$version/$file"
+      status=$(curl -sS -o /dev/null -w '%{http_code}' --header "JOB-TOKEN: $CI_JOB_TOKEN" "$url")
+      if [ "$status" = 200 ]; then
+        echo "agntree $version is already published"
+        exit 1
+      fi
+      curl -fsS --retry 3 --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$file" "$url"
+      echo "Published $url"

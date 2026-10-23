@@ -8,12 +8,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 npm install                      # Install dependencies
 npm run compile                  # Build the extension
 npm run watch                    # Build with auto-rebuild on changes
+npm run typecheck                # Type-check (esbuild alone does not)
+npm test                         # Type-check, then run the unit tests
 npm run lint                     # Run ESLint
 npx @vscode/vsce package         # Package as .vsix for installation
 code --install-extension *.vsix  # Install the packaged extension
 ```
 
 To test during development: Press F5 in VS Code to launch the Extension Development Host.
+
+## Unit Tests
+
+Tests live in `src/test/*.test.ts` and use Node's built-in test runner (`node:test`). `scripts/test.js` bundles them with esbuild into `out-test/` and runs `node --test`, so there are no extra test dependencies.
+
+- Tests cover code that doesn't import `vscode`: `GitService` (against real temporary git repositories), `ClaudeSessionService` (against a fake `~/.claude`), and the helpers in `src/utils/`. Keep logic you want tested out of the command and provider files.
+- `src/test/helpers.ts` isolates git from your own config (`GIT_CONFIG_GLOBAL`, no system config), so signing, hooks or `autocrlf` can't change results.
+- Known bugs that aren't fixed yet are written as `{ todo: '...' }` tests: they run and report but don't fail the suite, and start passing when the bug is fixed.
+- Pass extra flags through to `node --test`, e.g. `node scripts/test.js --test-name-pattern=rename`.
 
 ## Architecture
 
@@ -22,7 +33,7 @@ This is a VS Code extension that manages Claude Code CLI sessions across git rep
 ### Core Services (`src/services/`)
 
 - **StorageService** - Persists repositories and sessions to VS Code's globalState
-- **GitService** - Git operations: worktree listing/creation/deletion, branch merging, commit tracking, diff generation, PR fetching via `gh` CLI
+- **GitService** - Git operations: worktree listing/creation/deletion, branch merging, working tree status, rebase, and fetching PRs. Every call is async, uses `execFile` with an argument array (never a shell), and has a timeout. Never add a synchronous git call: in a Remote-SSH window the extension host also runs the Git extension and language servers, and blocking it freezes them all.
 - **TerminalManager** - Spawns and manages VS Code terminals running `claude` CLI
 - **ClaudeSessionService** - Discovers existing Claude Code sessions from `~/.claude/projects/`, copies sessions between worktrees for forking, repository-wide session search via `findSessionsForRepository()`
 
@@ -84,6 +95,8 @@ Quick Actions allow running Claude prompts or shell commands with one click from
    spawn(command, { cwd: worktreePath, shell: true })
    ```
 
+The `agntree.quickActions` setting is `"scope": "application"`, so it can only be set in user settings. Keep it that way: both modes run arbitrary commands, and a workspace-scoped setting would let any repository's `.vscode/settings.json` (including a PR checked out from a fork) redefine them.
+
 ### Process Management
 
 The `QuickActionsTreeProvider` tracks running processes in a `Map<number, ChildProcess>`. This enables:
@@ -116,20 +129,25 @@ When creating a worktree with a new branch, the user selects:
 
 ### Auto-Refresh on Branch Switch
 
-The `WorkspacesTreeProvider` watches `.git/HEAD` and `.git/worktrees/*/HEAD` files using `vscode.RelativePattern` with absolute paths. This allows detecting branch changes even for repositories outside the current workspace. The tree auto-refreshes within 300ms of a branch switch.
+The `WorkspacesTreeProvider` watches `.git/HEAD` and `.git/worktrees/*/HEAD` files using `vscode.RelativePattern` with absolute paths. This allows detecting branch changes even for repositories outside the current workspace, and worktrees being added or removed (including ones Claude Code creates). The tree auto-refreshes within 300ms.
+
+### Branch vs. display name
+
+`Worktree.name` is for display: the branch, or the folder name when HEAD is detached (for example mid-rebase). Anything that operates on a branch (delete, merge, PR lookup) must use `Worktree.branch`, which is `null` for detached worktrees. Using `name` once made "Delete Worktree & Branch" force-delete an unrelated branch that happened to share the folder's name.
+
+Deleting a branch goes through `GitService.deleteBranch()`, which refuses an unmerged branch (reporting how many commits would be lost) unless called with `force`; the command asks before forcing.
 
 ## PR Checkout
 
-The `agntree.checkoutPR` command creates a worktree from a GitHub pull request. It uses `gh` CLI for both PR discovery and fetching.
+The `agntree.checkoutPR` command creates a worktree from a GitHub pull request. It uses the `gh` CLI to list and look up PRs, and plain `git fetch` to get them.
 
 ### Flow
 
-1. User selects a PR from a list (via `gh pr list`) or enters a PR number/URL manually
-2. The PR's branch name (`headRefName`) is extracted via `gh pr view`
-3. A local branch `pr-<number>` is created using `gh pr checkout <number> --branch pr-<number>` (handles remote resolution for forks automatically)
-4. The checkout is immediately reverted with `git checkout -` — the local branch remains
-5. A worktree is created from `pr-<number>`, stored in `<repo>-worktrees/<branch-name-with-hyphens>/`
-6. The PR number is associated with the worktree via `storageService.setPRWorktree()`
+1. User selects a PR from a list (via `gh pr list`) or enters a PR number/URL manually (resolved with `gh pr view`)
+2. The PR's URL gives the repository it was opened against; `findRemoteForPullRequest()` matches it to a local remote (https, `git@host:` and `ssh://` forms all match). If none matches, the user is asked before fetching from the repository's URL directly
+3. `git fetch <remote> refs/pull/<number>/head:refs/heads/pr-<number>` creates the local branch. GitHub publishes every PR there, including PRs from forks, and nothing is checked out, so the main worktree (and any session running in it) is never touched. An existing `pr-<number>` is only fast-forwarded, never reset
+4. A worktree is created from `pr-<number>`, stored in `<repo>-worktrees/<branch-name-with-hyphens>/`
+5. The PR number is associated with the worktree via `storageService.setPRWorktree()`, and removed again when the worktree is deleted
 
 ### Why `pr-<number>` branch names?
 

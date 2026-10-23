@@ -1,868 +1,842 @@
-import { execFileSync } from 'child_process';
+import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Worktree, FileChange } from '../types';
+import { Worktree, FileChange, WorkingTreeStatus } from '../types';
 
-/** Error shape thrown by execFileSync (carries captured stdio and exit status). */
-interface ExecError {
-  stdout?: string;
-  stderr?: string;
-  status?: number | null;
-  message?: string;
+/** Time limits for git commands, in milliseconds. 0 means no limit. */
+export const GIT_TIMEOUTS = {
+  /** Quick local commands: status, rev-parse, worktree list, add, ... */
+  local: 30_000,
+  /** Local commands that can legitimately run long: merge, rebase, apply */
+  long: 10 * 60_000,
+  /** Commands that talk to a remote */
+  network: 5 * 60_000,
+} as const;
+
+export interface GitRunOptions {
+  cwd?: string;
+  /** Text for stdin. Stdin is closed either way, so git never waits on it. */
+  input?: string;
+  /** Kill git after this long. Defaults to GIT_TIMEOUTS.local; 0 disables the limit. */
+  timeoutMs?: number;
+  /** Cancels the command, e.g. from a cancellable progress notification. */
+  signal?: AbortSignal;
+  /** Extra environment variables for this command. */
+  env?: Record<string, string>;
+}
+
+/** A git command that exited non-zero, timed out, was cancelled, or couldn't start. */
+export class GitError extends Error {
+  constructor(
+    message: string,
+    public readonly args: string[],
+    public readonly exitCode: number | null,
+    public readonly stdout: string,
+    public readonly stderr: string,
+    public readonly timedOut: boolean,
+    public readonly cancelled: boolean
+  ) {
+    super(message);
+    this.name = 'GitError';
+  }
+}
+
+/** The git subcommand in an argument list, skipping leading `-c key=value` options. */
+function subcommand(args: string[]): string {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-c') {
+      i++;
+    } else if (!args[i].startsWith('-')) {
+      return args[i];
+    }
+  }
+  return '';
+}
+
+/** The most useful explanation of a failure: git's own message, or what happened. */
+export function describeGitError(error: unknown): string {
+  if (error instanceof GitError) {
+    const command = `git ${subcommand(error.args)}`.trim();
+    if (error.cancelled) {
+      return `${command} was cancelled.`;
+    }
+    if (error.timedOut) {
+      return `${command} timed out.`;
+    }
+    return error.stderr.trim() || error.stdout.trim() || error.message;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+export type GitResult = { ok: true } | { ok: false; error: string };
+
+export type MergeResult = { ok: true } | { ok: false; conflicts: string[]; error: string };
+
+export type DeleteBranchResult =
+  | { deleted: true }
+  /** Refused because the branch has commits that aren't in `mergeTarget`. */
+  | { deleted: false; notMerged: true; unmergedCommits: number; mergeTarget: string }
+  | { deleted: false; notMerged: false; error: string };
+
+export interface RebaseConflictCheck {
+  /** False when git can't pre-check conflicts (needs `merge-tree --write-tree`, git 2.38+). */
+  checked: boolean;
+  hasConflicts: boolean;
+  conflictingFiles: string[];
+}
+
+/** One entry of `git worktree list --porcelain`. */
+export interface WorktreeListEntry {
+  path: string;
+  head: string | null;
+  /** Local branch name, or null when detached */
+  branch: string | null;
+  detached: boolean;
+  bare: boolean;
+}
+
+/** One entry of `git status --porcelain=v2 -z`. */
+export interface StatusEntry {
+  kind: 'changed' | 'renamed' | 'unmerged' | 'untracked' | 'ignored';
+  /** Index (staged) status letter, '.' when unchanged */
+  index: string;
+  /** Working tree (unstaged) status letter, '.' when unchanged */
+  worktree: string;
+  path: string;
+  origPath?: string;
+}
+
+type LineCounts = Map<string, { additions: number; deletions: number }>;
+
+/** Parse `git worktree list --porcelain`. The first entry is always the main worktree. */
+export function parseWorktreeList(output: string): WorktreeListEntry[] {
+  const entries: WorktreeListEntry[] = [];
+  let current: WorktreeListEntry | undefined;
+
+  for (const line of output.split(/\r?\n/)) {
+    if (line.startsWith('worktree ')) {
+      current = { path: line.slice('worktree '.length), head: null, branch: null, detached: false, bare: false };
+      entries.push(current);
+    } else if (!current) {
+      continue;
+    } else if (line.startsWith('HEAD ')) {
+      current.head = line.slice('HEAD '.length);
+    } else if (line.startsWith('branch ')) {
+      const ref = line.slice('branch '.length);
+      current.branch = ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref;
+    } else if (line === 'detached') {
+      current.detached = true;
+    } else if (line === 'bare') {
+      current.bare = true;
+    }
+  }
+
+  return entries;
 }
 
 /**
- * Service for git operations including worktree management and change tracking.
+ * Parse `git status --porcelain=v2 -z`. Paths are raw (no C-quoting) and renames
+ * carry their original path, which the old `--numstat` parsing got wrong.
+ */
+export function parseStatusV2(output: string): StatusEntry[] {
+  const tokens = output.split('\0');
+  const entries: StatusEntry[] = [];
+
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (!token || token.startsWith('# ')) {
+      continue;
+    }
+    const fields = token.split(' ');
+    switch (token[0]) {
+      case '1': // 1 XY sub mH mI mW hH hI path
+        entries.push({ kind: 'changed', index: fields[1][0], worktree: fields[1][1], path: fields.slice(8).join(' ') });
+        break;
+      case '2': // 2 XY sub mH mI mW hH hI Xscore path, then the original path as the next token
+        entries.push({
+          kind: 'renamed',
+          index: fields[1][0],
+          worktree: fields[1][1],
+          path: fields.slice(9).join(' '),
+          origPath: tokens[++i],
+        });
+        break;
+      case 'u': // u XY sub m1 m2 m3 mW h1 h2 h3 path
+        entries.push({ kind: 'unmerged', index: fields[1][0], worktree: fields[1][1], path: fields.slice(10).join(' ') });
+        break;
+      case '?':
+        entries.push({ kind: 'untracked', index: '?', worktree: '?', path: token.slice(2) });
+        break;
+      case '!':
+        entries.push({ kind: 'ignored', index: '!', worktree: '!', path: token.slice(2) });
+        break;
+    }
+  }
+
+  return entries;
+}
+
+/** Parse `git diff --numstat -z` into line counts keyed by (new) path. Binary files count as 0. */
+export function parseNumstatZ(output: string): LineCounts {
+  const counts: LineCounts = new Map();
+  const tokens = output.split('\0');
+
+  for (let i = 0; i < tokens.length; i++) {
+    const match = /^(-|\d+)\t(-|\d+)\t([\s\S]*)$/.exec(tokens[i]);
+    if (!match) {
+      continue;
+    }
+    let filePath = match[3];
+    if (filePath === '') {
+      // Rename or copy: the old and new paths follow as separate tokens.
+      i += 2;
+      filePath = tokens[i];
+    }
+    counts.set(filePath, {
+      additions: match[1] === '-' ? 0 : Number(match[1]),
+      deletions: match[2] === '-' ? 0 : Number(match[2]),
+    });
+  }
+
+  return counts;
+}
+
+function stagedStatus(letter: string): FileChange['status'] {
+  switch (letter) {
+    case 'A':
+    case 'C':
+      return 'added';
+    case 'D':
+      return 'deleted';
+    case 'R':
+      return 'renamed';
+    default:
+      return 'modified';
+  }
+}
+
+function unstagedStatus(letter: string): FileChange['status'] {
+  switch (letter) {
+    case 'A': // intent-to-add
+      return 'added';
+    case 'D':
+      return 'deleted';
+    default:
+      return 'modified';
+  }
+}
+
+/** Combine parsed status and line counts into the Changes panel's staged/unstaged lists. */
+export function buildWorkingTreeStatus(entries: StatusEntry[], stagedCounts: LineCounts, unstagedCounts: LineCounts): WorkingTreeStatus {
+  const staged: FileChange[] = [];
+  const unstaged: FileChange[] = [];
+  const counts = (map: LineCounts, filePath: string) => map.get(filePath) ?? { additions: 0, deletions: 0 };
+
+  for (const entry of entries) {
+    switch (entry.kind) {
+      case 'untracked':
+        unstaged.push({ path: entry.path, status: 'untracked', additions: 0, deletions: 0 });
+        break;
+      case 'unmerged':
+        unstaged.push({ path: entry.path, status: 'conflicted', ...counts(unstagedCounts, entry.path) });
+        break;
+      case 'changed':
+      case 'renamed':
+        if (entry.index !== '.') {
+          staged.push({
+            path: entry.path,
+            ...(entry.origPath !== undefined ? { origPath: entry.origPath } : {}),
+            status: stagedStatus(entry.index),
+            ...counts(stagedCounts, entry.path),
+          });
+        }
+        if (entry.worktree !== '.') {
+          unstaged.push({ path: entry.path, status: unstagedStatus(entry.worktree), ...counts(unstagedCounts, entry.path) });
+        }
+        break;
+    }
+  }
+
+  return { staged, unstaged };
+}
+
+/**
+ * Git operations for worktrees, branches, and the Changes panel.
  *
- * All git invocations go through {@link GitService.run}, which uses `execFileSync`
- * with an argument array (no shell). This is deliberate: branch names, paths, and
- * file names can contain shell metacharacters (and, for PRs, come from untrusted
- * third parties), so they must never be interpolated into a shell command string.
+ * Every command goes through {@link GitService.run}: `execFile` with an argument array
+ * (never a shell, since branch names and paths can come from third-party PRs), run
+ * asynchronously with a timeout so a slow or hung git can't freeze the extension host.
+ * In a Remote-SSH window that host also runs the Git extension and language servers.
  */
 export class GitService {
   /** Generous output limit so large repos' status/diff output isn't truncated. */
   private static readonly MAX_BUFFER = 64 * 1024 * 1024;
 
-  /**
-   * Run a git command with arguments passed as an array (never through a shell).
-   * Throws on non-zero exit, like the previous execSync usage.
-   */
-  private run(args: string[], opts: { cwd?: string; input?: string; maxBuffer?: number } = {}): string {
-    return execFileSync('git', args, {
-      cwd: opts.cwd,
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      input: opts.input,
-      maxBuffer: opts.maxBuffer ?? GitService.MAX_BUFFER,
-    }) as string;
+  private static readonly BASE_ENV: Record<string, string> = {
+    // Fail instead of waiting forever for a username/password prompt nobody can see.
+    GIT_TERMINAL_PROMPT: '0',
+    // Background status refreshes must not take index.lock, or an agent's concurrent
+    // `git commit` in the same worktree can fail with "index.lock exists".
+    GIT_OPTIONAL_LOCKS: '0',
+  };
+
+  /** Run git and resolve with stdout. Rejects with a {@link GitError}. */
+  protected run(args: string[], opts: GitRunOptions = {}): Promise<string> {
+    const fullArgs = ['-c', 'core.quotePath=false', ...args];
+
+    return new Promise<string>((resolve, reject) => {
+      const child = execFile(
+        'git',
+        fullArgs,
+        {
+          cwd: opts.cwd,
+          encoding: 'utf8',
+          maxBuffer: GitService.MAX_BUFFER,
+          timeout: opts.timeoutMs ?? GIT_TIMEOUTS.local,
+          signal: opts.signal,
+          windowsHide: true,
+          env: { ...process.env, ...GitService.BASE_ENV, ...opts.env },
+        },
+        (error, stdout, stderr) => {
+          if (!error) {
+            resolve(stdout);
+            return;
+          }
+          const err = error as NodeJS.ErrnoException & { code?: string | number | null; killed?: boolean };
+          const cancelled = opts.signal?.aborted === true || err.name === 'AbortError';
+          const timedOut = !cancelled && err.killed === true && err.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+          const message = err.code === 'ENOENT' ? 'git was not found. Install git or add it to PATH.' : err.message;
+          reject(new GitError(
+            message,
+            args,
+            typeof err.code === 'number' ? err.code : null,
+            String(stdout ?? ''),
+            String(stderr ?? ''),
+            timedOut,
+            cancelled
+          ));
+        }
+      );
+      // Ignore EPIPE if git exits before reading stdin.
+      child.stdin?.on('error', () => undefined);
+      child.stdin?.end(opts.input ?? '');
+    });
   }
 
-  /**
-   * Check if a directory is a git repository
-   */
-  isGitRepository(dirPath: string): boolean {
+  /** Run git; resolve with stdout, or null if it failed. */
+  private async tryRun(args: string[], opts?: GitRunOptions): Promise<string | null> {
     try {
-      this.run(['rev-parse', '--git-dir'], { cwd: dirPath });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Get the root path of the git repository
-   */
-  getRepoRoot(dirPath: string): string | null {
-    try {
-      return this.run(['rev-parse', '--show-toplevel'], { cwd: dirPath }).trim();
+      return await this.run(args, opts);
     } catch {
       return null;
     }
   }
 
-  /**
-   * List all worktrees for a repository
-   */
-  listWorktrees(repoPath: string, repoId: string): Worktree[] {
+  /** Run git for its side effect and report success or git's error message. */
+  private async attempt(args: string[], opts?: GitRunOptions): Promise<GitResult> {
     try {
-      const output = this.run(['worktree', 'list', '--porcelain'], { cwd: repoPath });
-
-      const worktrees: Worktree[] = [];
-      const entries = output.trim().split('\n\n');
-
-      for (const entry of entries) {
-        if (!entry.trim()) continue;
-
-        const lines = entry.split('\n');
-        let worktreePath = '';
-        let branch = '';
-        let isMain = false;
-
-        for (const line of lines) {
-          if (line.startsWith('worktree ')) {
-            worktreePath = line.substring(9);
-          } else if (line.startsWith('branch ')) {
-            // refs/heads/main -> main
-            branch = line.substring(7).replace('refs/heads/', '');
-          } else if (line === 'bare') {
-            // Skip bare repositories
-            continue;
-          }
-        }
-
-        // Determine if this is the main worktree (same as repo root)
-        isMain = path.resolve(worktreePath) === path.resolve(repoPath);
-
-        if (worktreePath) {
-          worktrees.push({
-            id: this.generateWorktreeId(repoId, worktreePath),
-            repoId,
-            name: branch || path.basename(worktreePath),
-            path: worktreePath,
-            isMain,
-          });
-        }
-      }
-
-      return worktrees;
+      await this.run(args, opts);
+      return { ok: true };
     } catch (error) {
-      console.error('Failed to list worktrees:', error);
-      return [];
+      return { ok: false, error: describeGitError(error) };
     }
   }
 
-  /**
-   * Generate a deterministic ID for a worktree based on repo and path
-   */
-  private generateWorktreeId(repoId: string, worktreePath: string): string {
-    // Create a deterministic ID so we can reliably link chats to worktrees
-    const normalized = path.resolve(worktreePath);
-    const hash = this.simpleHash(`${repoId}:${normalized}`);
-    return `wt-${hash}`;
+  // ============ Repository ============
+
+  async isGitRepository(dirPath: string): Promise<boolean> {
+    return (await this.tryRun(['rev-parse', '--git-dir'], { cwd: dirPath })) !== null;
+  }
+
+  async getRepoRoot(dirPath: string): Promise<string | null> {
+    const output = await this.tryRun(['rev-parse', '--show-toplevel'], { cwd: dirPath });
+    return output ? output.trim() : null;
+  }
+
+  async clone(url: string, destination: string, signal?: AbortSignal): Promise<GitResult> {
+    // `--` stops a URL that starts with "-" being read as an option.
+    return this.attempt(['clone', '--', url, destination], { timeoutMs: 0, signal });
+  }
+
+  // ============ Worktrees ============
+
+  async listWorktrees(repoPath: string, repoId: string): Promise<Worktree[]> {
+    let output: string;
+    try {
+      output = await this.run(['worktree', 'list', '--porcelain'], { cwd: repoPath });
+    } catch (error) {
+      console.error('Failed to list worktrees:', describeGitError(error));
+      return [];
+    }
+
+    const entries = parseWorktreeList(output);
+    return entries
+      .filter((entry) => !entry.bare)
+      .map((entry) => ({
+        id: this.generateWorktreeId(repoId, entry.path),
+        repoId,
+        name: entry.branch ?? path.basename(entry.path),
+        branch: entry.branch,
+        head: entry.head,
+        path: entry.path,
+        // git always lists the main worktree first
+        isMain: entry === entries[0],
+        isDetached: entry.branch === null,
+      }));
   }
 
   /**
-   * Simple hash function for generating deterministic IDs
+   * Deterministic ID for a worktree, so chats stay linked across refreshes.
+   * Changing this orphans every saved chat.
    */
+  private generateWorktreeId(repoId: string, worktreePath: string): string {
+    const normalized = path.resolve(worktreePath);
+    return `wt-${this.simpleHash(`${repoId}:${normalized}`)}`;
+  }
+
   private simpleHash(str: string): string {
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
-      const char = str.charCodeAt(i);
-      hash = (hash << 5) - hash + char;
+      hash = (hash << 5) - hash + str.charCodeAt(i);
       hash = hash & hash; // Convert to 32bit integer
     }
     return Math.abs(hash).toString(16).padStart(8, '0');
   }
 
-  /**
-   * Create a new worktree
-   */
-  createWorktree(repoPath: string, branch: string, worktreePath: string): boolean {
-    try {
-      this.run(['worktree', 'add', worktreePath, branch], { cwd: repoPath });
-      return true;
-    } catch (error) {
-      console.error('Failed to create worktree:', error);
-      return false;
-    }
+  async createWorktree(repoPath: string, branch: string, worktreePath: string): Promise<GitResult> {
+    return this.attempt(['worktree', 'add', '--', worktreePath, branch], { cwd: repoPath, timeoutMs: GIT_TIMEOUTS.long });
   }
 
-  /**
-   * Create a new worktree with a new branch
-   */
-  createWorktreeWithNewBranch(
+  async createWorktreeWithNewBranch(
     repoPath: string,
     newBranch: string,
     worktreePath: string,
     baseBranch: string = 'HEAD'
-  ): boolean {
+  ): Promise<GitResult> {
+    return this.attempt(['worktree', 'add', '-b', newBranch, '--', worktreePath, baseBranch], {
+      cwd: repoPath,
+      timeoutMs: GIT_TIMEOUTS.long,
+    });
+  }
+
+  async removeWorktree(repoPath: string, worktreePath: string, force: boolean = false): Promise<GitResult> {
+    const result = await this.attempt(['worktree', 'remove', ...(force ? ['--force'] : []), '--', worktreePath], {
+      cwd: repoPath,
+      timeoutMs: GIT_TIMEOUTS.long,
+    });
+    if (result.ok) {
+      return result;
+    }
+    // A worktree whose .git is a directory instead of a file can't be removed by git.
+    if (result.error.includes('is not a .git file') || result.error.includes('error code 3')) {
+      console.log('Worktree has invalid .git structure, attempting manual cleanup...');
+      return this.forceRemoveWorktree(repoPath, worktreePath);
+    }
+    return result;
+  }
+
+  private async forceRemoveWorktree(repoPath: string, worktreePath: string): Promise<GitResult> {
     try {
-      this.run(['worktree', 'add', '-b', newBranch, worktreePath, baseBranch], { cwd: repoPath });
-      return true;
+      await this.tryRun(['worktree', 'prune'], { cwd: repoPath });
+      await fs.promises.rm(path.resolve(worktreePath), { recursive: true, force: true });
+      await this.tryRun(['worktree', 'prune'], { cwd: repoPath });
+      return { ok: true };
     } catch (error) {
-      console.error('Failed to create worktree with new branch:', error);
-      return false;
+      return { ok: false, error: describeGitError(error) };
     }
   }
 
-  /**
-   * Remove a worktree
-   */
-  removeWorktree(repoPath: string, worktreePath: string, force: boolean = false): boolean {
-    try {
-      const args = ['worktree', 'remove', ...(force ? ['--force'] : []), worktreePath];
-      this.run(args, { cwd: repoPath });
-      return true;
-    } catch (error: unknown) {
-      const execError = error as ExecError;
-      const errorMessage = execError.stderr || execError.message || String(error);
+  // ============ Branches ============
 
-      // Handle case where .git is a directory instead of a file (corrupted worktree)
-      if (errorMessage.includes('is not a .git file') || errorMessage.includes('error code 3')) {
-        console.log('Worktree has invalid .git structure, attempting manual cleanup...');
-        return this.forceRemoveWorktree(repoPath, worktreePath);
-      }
-
-      console.error('Failed to remove worktree:', error);
-      return false;
-    }
+  async getCurrentCommit(worktreePath: string): Promise<string | null> {
+    const output = await this.tryRun(['rev-parse', '--verify', '-q', 'HEAD'], { cwd: worktreePath });
+    return output ? output.trim() : null;
   }
 
-  /**
-   * Force remove a worktree with invalid .git structure
-   */
-  private forceRemoveWorktree(repoPath: string, worktreePath: string): boolean {
-    const resolvedPath = path.resolve(worktreePath);
-
-    try {
-      // Prune stale worktree references first
-      try {
-        this.run(['worktree', 'prune'], { cwd: repoPath });
-      } catch {
-        // Non-fatal, continue
-      }
-
-      // Remove the directory if it exists
-      if (fs.existsSync(resolvedPath)) {
-        fs.rmSync(resolvedPath, { recursive: true, force: true });
-      }
-
-      // Prune again to clean up any remaining references
-      try {
-        this.run(['worktree', 'prune'], { cwd: repoPath });
-      } catch {
-        // Non-fatal
-      }
-
-      return true;
-    } catch (error) {
-      console.error('Failed to force remove worktree:', error);
-      return false;
-    }
+  async getCurrentBranch(worktreePath: string): Promise<string | null> {
+    const output = await this.tryRun(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: worktreePath });
+    return output ? output.trim() : null;
   }
 
-  /**
-   * Delete a branch
-   */
-  deleteBranch(repoPath: string, branchName: string, force: boolean = false): boolean {
-    try {
-      this.run(['branch', force ? '-D' : '-d', branchName], { cwd: repoPath });
-      return true;
-    } catch (error) {
-      console.error('Failed to delete branch:', error);
-      return false;
-    }
-  }
-
-  /**
-   * Check if a worktree has uncommitted changes
-   */
-  hasUncommittedChanges(worktreePath: string): boolean {
-    try {
-      const output = this.run(['status', '--porcelain'], { cwd: worktreePath });
-      return output.trim().length > 0;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Copy uncommitted changes from one worktree to another.
-   * Creates a patch from the source and applies it to the destination.
-   * Also copies untracked files.
-   */
-  copyUncommittedChanges(sourceWorktree: string, destWorktree: string): boolean {
-    try {
-      // Get list of all changes (tracked and untracked)
-      const statusOutput = this.run(['status', '--porcelain'], { cwd: sourceWorktree });
-
-      if (!statusOutput.trim()) {
-        return true; // No changes to copy
-      }
-
-      // Create a patch for tracked changes (both staged and unstaged)
-      try {
-        const patchOutput = this.run(['diff', 'HEAD'], {
-          cwd: sourceWorktree,
-          maxBuffer: 50 * 1024 * 1024, // 50MB buffer for large diffs
-        });
-
-        if (patchOutput.trim()) {
-          // Apply the patch to destination
-          this.run(['apply', '--3way', '-'], {
-            cwd: destWorktree,
-            input: patchOutput,
-          });
-        }
-      } catch (patchError) {
-        console.error('Failed to apply patch:', patchError);
-        // Continue to try copying untracked files
-      }
-
-      // Handle untracked files - copy them directly (fs, not shell tools)
-      const lines = statusOutput.trim().split('\n');
-      for (const line of lines) {
-        if (line.startsWith('??')) {
-          // Untracked file
-          const filePath = line.substring(3).trim();
-          const sourcePath = path.join(sourceWorktree, filePath);
-          const destPath = path.join(destWorktree, filePath);
-
-          try {
-            fs.mkdirSync(path.dirname(destPath), { recursive: true });
-            fs.cpSync(sourcePath, destPath, { recursive: true });
-          } catch (copyError) {
-            console.error(`Failed to copy untracked file ${filePath}:`, copyError);
-          }
-        }
-      }
-
-      return true;
-    } catch (error) {
-      console.error('Failed to copy uncommitted changes:', error);
-      return false;
-    }
-  }
-
-  /**
-   * Merge a source branch into the target worktree
-   * @param targetWorktreePath - Path to the worktree where merge will happen
-   * @param sourceBranch - Branch name to merge from
-   * @returns Object with success status and optional error message
-   */
-  mergeBranch(
-    targetWorktreePath: string,
-    sourceBranch: string
-  ): { success: boolean; error?: string } {
-    try {
-      // Regular merge with --no-ff to preserve branch history
-      this.run(['merge', '--no-ff', sourceBranch], { cwd: targetWorktreePath });
-      return { success: true };
-    } catch (error: unknown) {
-      const execError = error as ExecError;
-      const errorMessage = execError.stderr || execError.message || String(error);
-      console.error('Failed to merge branch:', errorMessage);
-      return { success: false, error: errorMessage };
-    }
-  }
-
-  /**
-   * Get the current HEAD commit SHA
-   */
-  getCurrentCommit(worktreePath: string): string | null {
-    try {
-      return this.run(['rev-parse', 'HEAD'], { cwd: worktreePath }).trim();
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Get the current branch name
-   */
-  getCurrentBranch(worktreePath: string): string | null {
-    try {
-      return this.run(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: worktreePath }).trim();
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Get list of available branches
-   */
-  getBranches(repoPath: string): string[] {
-    try {
-      const result = this.run(['branch', '-a', '--format=%(refname:short)'], { cwd: repoPath });
-      return result
-        .trim()
-        .split('\n')
-        .filter((b) => b && !b.includes('->'));
-    } catch {
+  /** Local branches, then remote-tracking branches as `remote/branch`. Skips `remote/HEAD`. */
+  async getBranches(repoPath: string): Promise<string[]> {
+    const output = await this.tryRun(['for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes'], { cwd: repoPath });
+    if (!output) {
       return [];
     }
+    const branches: string[] = [];
+    for (const ref of output.split('\n')) {
+      if (ref.startsWith('refs/heads/')) {
+        branches.push(ref.slice('refs/heads/'.length));
+      } else if (ref.startsWith('refs/remotes/') && !ref.endsWith('/HEAD')) {
+        branches.push(ref.slice('refs/remotes/'.length));
+      }
+    }
+    return branches;
   }
 
-  /**
-   * List all remotes
-   */
-  listRemotes(repoPath: string): string[] {
-    try {
-      const output = this.run(['remote'], { cwd: repoPath });
-      return output.trim().split('\n').filter(r => r);
-    } catch {
+  /** Remote-tracking branches of one remote, as `remote/branch`. */
+  async getRemoteBranches(repoPath: string, remoteName: string): Promise<string[]> {
+    const output = await this.tryRun(['for-each-ref', '--format=%(refname)', `refs/remotes/${remoteName}/`], { cwd: repoPath });
+    if (!output) {
       return [];
     }
+    return output
+      .split('\n')
+      .filter((ref) => ref.startsWith(`refs/remotes/${remoteName}/`) && !ref.endsWith('/HEAD'))
+      .map((ref) => ref.slice('refs/remotes/'.length));
+  }
+
+  /** Whether `ancestor` is reachable from `descendant`. */
+  async isAncestor(repoPath: string, ancestor: string, descendant: string): Promise<boolean> {
+    return (await this.tryRun(['merge-base', '--is-ancestor', ancestor, descendant], { cwd: repoPath })) !== null;
+  }
+
+  async countCommits(repoPath: string, range: string): Promise<number> {
+    const output = await this.tryRun(['rev-list', '--count', range], { cwd: repoPath });
+    return output ? Number(output.trim()) || 0 : 0;
+  }
+
+  /** Short name of the branch's upstream (e.g. `origin/main`), if it has one. */
+  async getUpstream(repoPath: string, branch: string): Promise<string | null> {
+    const output = await this.tryRun(['rev-parse', '--abbrev-ref', '--symbolic-full-name', `${branch}@{upstream}`], { cwd: repoPath });
+    return output ? output.trim() : null;
   }
 
   /**
-   * Check if a specific remote exists
+   * Delete a local branch. Without `force`, refuses (and says how many commits would be
+   * lost) when the branch isn't merged into its upstream, or into `repoPath`'s HEAD when
+   * it has no upstream: the same rule `git branch -d` uses, checked here so the caller
+   * can ask before forcing.
    */
-  hasRemote(repoPath: string, remoteName: string): boolean {
-    return this.listRemotes(repoPath).includes(remoteName);
+  async deleteBranch(repoPath: string, branch: string, options: { force?: boolean } = {}): Promise<DeleteBranchResult> {
+    if ((await this.tryRun(['rev-parse', '--verify', '-q', `refs/heads/${branch}`], { cwd: repoPath })) === null) {
+      return { deleted: false, notMerged: false, error: `Branch "${branch}" does not exist.` };
+    }
+    if (!options.force) {
+      const upstream = await this.getUpstream(repoPath, branch);
+      const reference = upstream ?? 'HEAD';
+      if (!(await this.isAncestor(repoPath, `refs/heads/${branch}`, reference))) {
+        const unmergedCommits = await this.countCommits(repoPath, `${reference}..refs/heads/${branch}`);
+        const mergeTarget = upstream ?? (await this.getCurrentBranch(repoPath)) ?? 'HEAD';
+        return { deleted: false, notMerged: true, unmergedCommits, mergeTarget };
+      }
+    }
+    const result = await this.attempt(['branch', options.force ? '-D' : '-d', '--', branch], { cwd: repoPath });
+    return result.ok ? { deleted: true } : { deleted: false, notMerged: false, error: result.error };
+  }
+
+  // ============ Remotes ============
+
+  async listRemotes(repoPath: string): Promise<string[]> {
+    const output = await this.tryRun(['remote'], { cwd: repoPath });
+    return output ? output.split('\n').map((r) => r.trim()).filter(Boolean) : [];
+  }
+
+  /** Remotes with their fetch URLs. */
+  async listRemoteUrls(repoPath: string): Promise<{ name: string; url: string }[]> {
+    const output = await this.tryRun(['remote', '-v'], { cwd: repoPath });
+    if (!output) {
+      return [];
+    }
+    const remotes = new Map<string, string>();
+    for (const line of output.split('\n')) {
+      const match = /^(\S+)\s+(\S+)\s+\(fetch\)$/.exec(line.trim());
+      if (match && !remotes.has(match[1])) {
+        remotes.set(match[1], match[2]);
+      }
+    }
+    return [...remotes].map(([name, url]) => ({ name, url }));
+  }
+
+  async hasRemote(repoPath: string, remoteName: string): Promise<boolean> {
+    return (await this.listRemotes(repoPath)).includes(remoteName);
+  }
+
+  async fetchRemote(repoPath: string, remoteName: string, signal?: AbortSignal): Promise<GitResult> {
+    return this.attempt(['fetch', '--', remoteName], { cwd: repoPath, timeoutMs: GIT_TIMEOUTS.network, signal });
   }
 
   /**
-   * Fetch from a specific remote
+   * Fetch a pull request's head into local branch `localBranch` without checking anything
+   * out. `source` is a remote name or URL for the repository the PR was opened against;
+   * GitHub publishes every PR there as `refs/pull/<n>/head`, including PRs from forks.
+   * An existing `localBranch` is only fast-forwarded, never reset.
    */
-  fetchRemote(repoPath: string, remoteName: string): boolean {
+  async fetchPullRequest(
+    repoPath: string,
+    prNumber: number,
+    localBranch: string,
+    source: string,
+    signal?: AbortSignal
+  ): Promise<GitResult> {
+    if (!Number.isInteger(prNumber) || prNumber <= 0) {
+      return { ok: false, error: `Invalid PR number: ${prNumber}` };
+    }
+    return this.attempt(['fetch', '--no-tags', '--', source, `refs/pull/${prNumber}/head:refs/heads/${localBranch}`], {
+      cwd: repoPath,
+      timeoutMs: GIT_TIMEOUTS.network,
+      signal,
+    });
+  }
+
+  // ============ Working tree status ============
+
+  async hasUncommittedChanges(worktreePath: string): Promise<boolean> {
+    const output = await this.tryRun(['status', '--porcelain'], { cwd: worktreePath });
+    return !!output && output.trim().length > 0;
+  }
+
+  /**
+   * Staged and unstaged changes. Three git calls in total, however many files changed
+   * (the old code ran one extra git process per file).
+   */
+  async getStatus(worktreePath: string): Promise<WorkingTreeStatus> {
     try {
-      this.run(['fetch', remoteName], { cwd: repoPath });
-      return true;
+      const [status, unstagedCounts, stagedCounts] = await Promise.all([
+        this.run(['status', '--porcelain=v2', '-z', '--untracked-files=all'], { cwd: worktreePath }),
+        this.run(['diff', '--numstat', '-z'], { cwd: worktreePath }),
+        this.run(['diff', '--cached', '--numstat', '-z'], { cwd: worktreePath }),
+      ]);
+      return buildWorkingTreeStatus(parseStatusV2(status), parseNumstatZ(stagedCounts), parseNumstatZ(unstagedCounts));
     } catch (error) {
-      console.error(`Failed to fetch from ${remoteName}:`, error);
-      return false;
+      console.error('Failed to read git status:', describeGitError(error));
+      return { staged: [], unstaged: [] };
     }
   }
 
-  /**
-   * Fetch a specific branch from origin
-   */
-  fetchBranch(repoPath: string, branchName: string): boolean {
-    try {
-      this.run(['fetch', 'origin', branchName], { cwd: repoPath });
-      return true;
-    } catch (error) {
-      console.error(`Failed to fetch branch ${branchName}:`, error);
-      return false;
+  async stageFiles(worktreePath: string, filePaths: string[]): Promise<GitResult> {
+    return this.attempt(['add', '--', ...filePaths], { cwd: worktreePath });
+  }
+
+  async unstageFiles(worktreePath: string, filePaths: string[]): Promise<GitResult> {
+    if (!(await this.getCurrentCommit(worktreePath))) {
+      // No commits yet, so there's no HEAD to reset to.
+      return this.attempt(['rm', '--cached', '-q', '--', ...filePaths], { cwd: worktreePath });
     }
+    return this.attempt(['reset', '-q', 'HEAD', '--', ...filePaths], { cwd: worktreePath });
   }
 
   /**
-   * Fetch a pull request using gh CLI and create a local branch.
-   * gh handles remote resolution automatically (origin, upstream, forks, etc.).
+   * Discard an unstaged change. Tracked files are restored from the index (staged changes
+   * are kept). Untracked files are deleted. Untracked folders are refused: with
+   * `--untracked-files=all` the only folders git reports are nested repositories, such
+   * as Claude Code worktrees under `.claude/worktrees/`.
    */
-  fetchPR(repoPath: string, prNumber: number, localBranchName: string): boolean {
+  async discardChange(worktreePath: string, change: FileChange): Promise<GitResult> {
+    if (change.status !== 'untracked') {
+      return this.attempt(['checkout', '--', change.path], { cwd: worktreePath });
+    }
+
+    const refuse: GitResult = {
+      ok: false,
+      error: `"${change.path}" is a folder (probably a nested repository or worktree), so it was not deleted.`,
+    };
+    if (change.path.endsWith('/')) {
+      return refuse;
+    }
+    const fullPath = path.join(worktreePath, change.path);
     try {
-      // gh pr checkout handles finding the correct remote and fetching.
-      // Passed as an argument array (no shell) — prNumber is numeric and the
-      // branch name is our own `pr-<n>`, but we still avoid shell interpolation.
-      execFileSync('gh', ['pr', 'checkout', String(prNumber), '--branch', localBranchName], {
-        cwd: repoPath,
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
+      if ((await fs.promises.lstat(fullPath)).isDirectory()) {
+        return refuse;
+      }
+      await fs.promises.unlink(fullPath);
+      return { ok: true };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { ok: true };
+      }
+      return { ok: false, error: describeGitError(error) };
+    }
+  }
+
+  /** Discard all unstaged changes (staged ones are kept) and delete untracked files. */
+  async discardAll(worktreePath: string): Promise<GitResult> {
+    const restored = await this.attempt(['checkout', '--', '.'], { cwd: worktreePath });
+    if (!restored.ok) {
+      return restored;
+    }
+    // Without -ff, git clean leaves nested repositories (e.g. .claude/worktrees/*) alone.
+    return this.attempt(['clean', '-fd'], { cwd: worktreePath });
+  }
+
+  async stageAll(worktreePath: string): Promise<GitResult> {
+    return this.attempt(['add', '-A'], { cwd: worktreePath });
+  }
+
+  async unstageAll(worktreePath: string): Promise<GitResult> {
+    if (!(await this.getCurrentCommit(worktreePath))) {
+      return this.attempt(['rm', '-r', '--cached', '-q', '.'], { cwd: worktreePath });
+    }
+    return this.attempt(['reset', '-q', 'HEAD'], { cwd: worktreePath });
+  }
+
+  /**
+   * Copy uncommitted changes from one worktree to another: tracked changes as a patch,
+   * untracked files directly. Nested repositories are not copied.
+   */
+  async copyUncommittedChanges(sourceWorktree: string, destWorktree: string): Promise<boolean> {
+    let ok = true;
+    try {
+      const patch = await this.run(['diff', 'HEAD', '--binary'], { cwd: sourceWorktree, timeoutMs: GIT_TIMEOUTS.long });
+      if (patch.trim()) {
+        await this.run(['apply', '--3way', '-'], { cwd: destWorktree, input: patch, timeoutMs: GIT_TIMEOUTS.long });
+      }
+    } catch (error) {
+      console.error('Failed to copy tracked changes:', describeGitError(error));
+      ok = false;
+    }
+
+    const status = await this.tryRun(['status', '--porcelain=v2', '-z', '--untracked-files=all'], { cwd: sourceWorktree });
+    for (const entry of parseStatusV2(status ?? '')) {
+      if (entry.kind !== 'untracked' || entry.path.endsWith('/')) {
+        continue;
+      }
+      try {
+        const destPath = path.join(destWorktree, entry.path);
+        await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+        await fs.promises.copyFile(path.join(sourceWorktree, entry.path), destPath);
+      } catch (error) {
+        console.error(`Failed to copy untracked file ${entry.path}:`, error);
+        ok = false;
+      }
+    }
+    return ok;
+  }
+
+  // ============ Merge ============
+
+  /**
+   * Merge `sourceBranch` into the worktree. On conflicts the worktree is left mid-merge,
+   * as git leaves it, and the conflicted files are returned so the caller can say so.
+   */
+  async mergeBranch(targetWorktreePath: string, sourceBranch: string): Promise<MergeResult> {
+    try {
+      await this.run(['merge', '--no-ff', '--no-edit', sourceBranch], {
+        cwd: targetWorktreePath,
+        timeoutMs: GIT_TIMEOUTS.long,
+        env: { GIT_EDITOR: 'true', GIT_MERGE_AUTOEDIT: 'no' },
       });
-      // Switch back to the previous branch — the local branch remains for worktree use
-      this.run(['checkout', '-'], { cwd: repoPath });
-      return true;
+      return { ok: true };
     } catch (error) {
-      console.error(`Failed to fetch PR #${prNumber}:`, error);
+      return { ok: false, conflicts: await this.getConflictedFiles(targetWorktreePath), error: describeGitError(error) };
+    }
+  }
+
+  async getConflictedFiles(worktreePath: string): Promise<string[]> {
+    const output = await this.tryRun(['diff', '--name-only', '--diff-filter=U', '-z'], { cwd: worktreePath });
+    return output ? output.split('\0').filter(Boolean) : [];
+  }
+
+  async abortMerge(worktreePath: string): Promise<GitResult> {
+    return this.attempt(['merge', '--abort'], { cwd: worktreePath });
+  }
+
+  // ============ Rebase ============
+
+  /** Suggested branch to rebase onto: upstream/main, upstream/master, origin/main, origin/master. */
+  async getRecommendedRebaseTarget(worktreePath: string): Promise<{ remote: string; branch: string } | null> {
+    const remotes = await this.listRemotes(worktreePath);
+    const remote = remotes.includes('upstream') ? 'upstream' : remotes.includes('origin') ? 'origin' : undefined;
+    if (!remote) {
+      return null;
+    }
+    const branches = await this.getRemoteBranches(worktreePath, remote);
+    const branch = [`${remote}/main`, `${remote}/master`].find((b) => branches.includes(b));
+    return branch ? { remote, branch } : null;
+  }
+
+  private async getGitDir(worktreePath: string): Promise<string | null> {
+    const output = await this.tryRun(['rev-parse', '--absolute-git-dir'], { cwd: worktreePath });
+    return output ? output.trim() : null;
+  }
+
+  private async exists(filePath: string): Promise<boolean> {
+    try {
+      await fs.promises.access(filePath);
+      return true;
+    } catch {
       return false;
     }
   }
 
-  /**
-   * Get branches for a specific remote
-   */
-  getRemoteBranches(repoPath: string, remoteName: string): string[] {
-    try {
-      const output = this.run(['branch', '-r', '--format=%(refname:short)'], { cwd: repoPath });
-      return output
-        .trim()
-        .split('\n')
-        .filter(b => b.startsWith(`${remoteName}/`) && !b.includes('->'));
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Get changed files since a base commit
-   */
-  getChangedFiles(worktreePath: string, baseCommit: string): FileChange[] {
-    try {
-      // Get diff stat
-      const output = this.run(['diff', '--numstat', `${baseCommit}..HEAD`], { cwd: worktreePath });
-
-      const changes: FileChange[] = [];
-
-      for (const line of output.trim().split('\n')) {
-        if (!line.trim()) continue;
-
-        const [additions, deletions, filePath] = line.split('\t');
-
-        // Handle binary files (shows as -)
-        const adds = additions === '-' ? 0 : parseInt(additions, 10);
-        const dels = deletions === '-' ? 0 : parseInt(deletions, 10);
-
-        let status: FileChange['status'] = 'modified';
-        if (adds > 0 && dels === 0) {
-          status = 'added';
-        } else if (adds === 0 && dels > 0) {
-          status = 'deleted';
-        }
-
-        changes.push({
-          path: filePath,
-          status,
-          additions: adds,
-          deletions: dels,
-        });
-      }
-
-      return changes;
-    } catch (error) {
-      console.error('Failed to get changed files:', error);
-      return [];
-    }
-  }
-
-  /**
-   * Get unstaged and staged changes (working tree status)
-   */
-  getWorkingTreeChanges(worktreePath: string): FileChange[] {
-    try {
-      const output = this.run(['diff', '--numstat', 'HEAD'], { cwd: worktreePath });
-
-      const changes: FileChange[] = [];
-
-      for (const line of output.trim().split('\n')) {
-        if (!line.trim()) continue;
-
-        const [additions, deletions, filePath] = line.split('\t');
-        const adds = additions === '-' ? 0 : parseInt(additions, 10);
-        const dels = deletions === '-' ? 0 : parseInt(deletions, 10);
-
-        let status: FileChange['status'] = 'modified';
-        if (adds > 0 && dels === 0) {
-          status = 'added';
-        } else if (adds === 0 && dels > 0) {
-          status = 'deleted';
-        }
-
-        changes.push({
-          path: filePath,
-          status,
-          additions: adds,
-          deletions: dels,
-        });
-      }
-
-      return changes;
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Get the diff for a specific file
-   */
-  getFileDiff(worktreePath: string, filePath: string, baseCommit?: string): string {
-    try {
-      const range = baseCommit ? `${baseCommit}..HEAD` : 'HEAD';
-      return this.run(['diff', range, '--', filePath], { cwd: worktreePath });
-    } catch {
-      return '';
-    }
-  }
-
-  /**
-   * Get staged changes (files added to index)
-   */
-  getStagedChanges(worktreePath: string): FileChange[] {
-    try {
-      const output = this.run(['diff', '--cached', '--numstat'], { cwd: worktreePath });
-      return this.parseNumstatOutput(output, worktreePath, true);
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Get unstaged changes (modified but not added to index)
-   */
-  getUnstagedChanges(worktreePath: string): FileChange[] {
-    try {
-      // Get modified tracked files
-      const trackedOutput = this.run(['diff', '--numstat'], { cwd: worktreePath });
-
-      const changes = this.parseNumstatOutput(trackedOutput, worktreePath, false);
-
-      // Get untracked files
-      const untrackedOutput = this.run(['ls-files', '--others', '--exclude-standard'], { cwd: worktreePath });
-
-      for (const line of untrackedOutput.trim().split('\n')) {
-        if (!line.trim()) continue;
-        changes.push({
-          path: line.trim(),
-          status: 'added',
-          additions: 0,
-          deletions: 0,
-        });
-      }
-
-      return changes;
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Parse git diff --numstat output into FileChange array.
-   * Status is resolved with filesystem/git lookups (no shell).
-   */
-  private parseNumstatOutput(output: string, worktreePath: string, staged: boolean): FileChange[] {
-    const changes: FileChange[] = [];
-
-    for (const line of output.trim().split('\n')) {
-      if (!line.trim()) continue;
-
-      const [additions, deletions, filePath] = line.split('\t');
-      const adds = additions === '-' ? 0 : parseInt(additions, 10);
-      const dels = deletions === '-' ? 0 : parseInt(deletions, 10);
-
-      let status: FileChange['status'] = 'modified';
-      const existsInWorkingTree = fs.existsSync(path.join(worktreePath, filePath));
-
-      if (!existsInWorkingTree) {
-        status = 'deleted';
-      } else if (staged) {
-        // For staged changes, check against HEAD to detect new files
-        try {
-          this.run(['cat-file', '-e', `HEAD:${filePath}`], { cwd: worktreePath });
-          status = 'modified';
-        } catch {
-          status = 'added';
-        }
-      } else {
-        // For unstaged changes, check if tracked in index
-        try {
-          this.run(['ls-files', '--error-unmatch', filePath], { cwd: worktreePath });
-          status = 'modified';
-        } catch {
-          status = 'added';
-        }
-      }
-
-      changes.push({
-        path: filePath,
-        status,
-        additions: adds,
-        deletions: dels,
-      });
-    }
-
-    return changes;
-  }
-
-  /**
-   * Stage a file
-   */
-  stageFile(worktreePath: string, filePath: string): boolean {
-    try {
-      this.run(['add', '--', filePath], { cwd: worktreePath });
-      return true;
-    } catch (error) {
-      console.error('Failed to stage file:', error);
+  async isRebaseInProgress(worktreePath: string): Promise<boolean> {
+    const gitDir = await this.getGitDir(worktreePath);
+    if (!gitDir) {
       return false;
     }
+    return (await this.exists(path.join(gitDir, 'rebase-merge'))) || (await this.exists(path.join(gitDir, 'rebase-apply')));
   }
 
-  /**
-   * Unstage a file
-   */
-  unstageFile(worktreePath: string, filePath: string): boolean {
-    try {
-      this.run(['reset', 'HEAD', '--', filePath], { cwd: worktreePath });
-      return true;
-    } catch (error) {
-      console.error('Failed to unstage file:', error);
-      return false;
+  async getRebaseProgress(worktreePath: string): Promise<{ current: number; total: number } | null> {
+    const gitDir = await this.getGitDir(worktreePath);
+    if (!gitDir) {
+      return null;
     }
-  }
-
-  /**
-   * Discard unstaged changes to a file (restore working tree from index)
-   */
-  discardFile(worktreePath: string, filePath: string): boolean {
-    try {
-      // Check if file is untracked
-      let tracked = true;
+    // The merge backend counts in msgnum/end; the apply backend in next/last.
+    const layouts = [
+      { dir: 'rebase-merge', current: 'msgnum', total: 'end' },
+      { dir: 'rebase-apply', current: 'next', total: 'last' },
+    ];
+    for (const layout of layouts) {
+      const dir = path.join(gitDir, layout.dir);
+      if (!(await this.exists(dir))) {
+        continue;
+      }
       try {
-        this.run(['ls-files', '--error-unmatch', filePath], { cwd: worktreePath });
+        const current = parseInt((await fs.promises.readFile(path.join(dir, layout.current), 'utf-8')).trim(), 10);
+        const total = parseInt((await fs.promises.readFile(path.join(dir, layout.total), 'utf-8')).trim(), 10);
+        return { current, total };
       } catch {
-        tracked = false;
-      }
-
-      if (tracked) {
-        // File is tracked - restore working tree from index (preserves staged changes)
-        this.run(['checkout', '--', filePath], { cwd: worktreePath });
-      } else {
-        // File is untracked - just delete it
-        const fullPath = path.join(worktreePath, filePath);
-        if (fs.existsSync(fullPath)) {
-          fs.unlinkSync(fullPath);
-        }
-      }
-      return true;
-    } catch (error) {
-      console.error('Failed to discard file:', error);
-      return false;
-    }
-  }
-
-  /**
-   * Discard all unstaged and untracked changes
-   */
-  discardAll(worktreePath: string): boolean {
-    try {
-      // Restore working tree from index (preserves staged changes)
-      this.run(['checkout', '--', '.'], { cwd: worktreePath });
-      // Remove all untracked files and directories
-      this.run(['clean', '-fd'], { cwd: worktreePath });
-      return true;
-    } catch (error) {
-      console.error('Failed to discard all changes:', error);
-      return false;
-    }
-  }
-
-  /**
-   * Stage all changes
-   */
-  stageAll(worktreePath: string): boolean {
-    try {
-      this.run(['add', '-A'], { cwd: worktreePath });
-      return true;
-    } catch (error) {
-      console.error('Failed to stage all:', error);
-      return false;
-    }
-  }
-
-  /**
-   * Unstage all changes
-   */
-  unstageAll(worktreePath: string): boolean {
-    try {
-      this.run(['reset', 'HEAD'], { cwd: worktreePath });
-      return true;
-    } catch (error) {
-      console.error('Failed to unstage all:', error);
-      return false;
-    }
-  }
-
-  getRebaseRemote(worktreePath: string): { remote: string; branch: string } | null {
-    try {
-      const remotes = this.listRemotes(worktreePath);
-      let remote: string | undefined;
-      if (remotes.includes('upstream')) {
-        remote = 'upstream';
-      } else if (remotes.includes('origin')) {
-        remote = 'origin';
-      }
-      if (!remote) {
         return null;
       }
-
-      // Fetch to ensure remote tracking branches are available
-      this.fetchRemote(worktreePath, remote);
-
-      const remoteBranches = this.getRemoteBranches(worktreePath, remote);
-      const branchNames = remoteBranches.map(b => b.replace(`${remote}/`, ''));
-      let branch: string | undefined;
-      if (branchNames.includes('main')) {
-        branch = `${remote}/main`;
-      } else if (branchNames.includes('master')) {
-        branch = `${remote}/master`;
-      }
-      if (!branch) {
-        return null;
-      }
-
-      return { remote, branch };
-    } catch {
-      return null;
     }
+    return null;
   }
 
-  isRebaseInProgress(worktreePath: string): boolean {
+  /** Predict whether rebasing onto `onto` will conflict, without touching the worktree. */
+  async checkRebaseConflicts(worktreePath: string, onto: string): Promise<RebaseConflictCheck> {
     try {
-      const gitDir = this.run(['rev-parse', '--git-dir'], { cwd: worktreePath }).trim();
-
-      const resolvedGitDir = path.isAbsolute(gitDir) ? gitDir : path.join(worktreePath, gitDir);
-      return fs.existsSync(path.join(resolvedGitDir, 'rebase-merge')) ||
-        fs.existsSync(path.join(resolvedGitDir, 'rebase-apply'));
-    } catch {
-      return false;
-    }
-  }
-
-  getRebaseProgress(worktreePath: string): { current: number; total: number } | null {
-    try {
-      const gitDir = this.run(['rev-parse', '--git-dir'], { cwd: worktreePath }).trim();
-
-      const resolvedGitDir = path.isAbsolute(gitDir) ? gitDir : path.join(worktreePath, gitDir);
-      let rebaseDir = path.join(resolvedGitDir, 'rebase-merge');
-      if (!fs.existsSync(rebaseDir)) {
-        rebaseDir = path.join(resolvedGitDir, 'rebase-apply');
-      }
-      if (!fs.existsSync(rebaseDir)) {
-        return null;
-      }
-
-      const current = parseInt(fs.readFileSync(path.join(rebaseDir, 'msgnum'), 'utf-8').trim(), 10);
-      const total = parseInt(fs.readFileSync(path.join(rebaseDir, 'end'), 'utf-8').trim(), 10);
-      return { current, total };
-    } catch {
-      return null;
-    }
-  }
-
-  checkRebaseConflicts(worktreePath: string, onto: string): { hasConflicts: boolean; conflictingFiles: string[] } {
-    try {
-      this.run(['merge-tree', '--write-tree', onto, 'HEAD'], { cwd: worktreePath });
-      return { hasConflicts: false, conflictingFiles: [] };
-    } catch (error: unknown) {
-      const execError = error as ExecError;
-      if (execError.status && execError.stdout) {
-        const files: string[] = [];
-        const lines = execError.stdout.split('\n');
-        for (const line of lines) {
-          const match = line.match(/^CONFLICT \([^)]+\): .* in (.+)$/);
-          if (match) {
-            files.push(match[1]);
-          }
-        }
-        return { hasConflicts: true, conflictingFiles: files };
-      }
-      return { hasConflicts: false, conflictingFiles: [] };
-    }
-  }
-
-  isUpToDate(worktreePath: string, ref: string): boolean {
-    try {
-      this.run(['merge-base', '--is-ancestor', ref, 'HEAD'], { cwd: worktreePath });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  rebase(worktreePath: string, onto: string): { success: boolean; error?: string } {
-    try {
-      this.run(['rebase', '--autostash', onto], { cwd: worktreePath });
-      return { success: true };
-    } catch (error: unknown) {
-      const execError = error as ExecError;
-      const errorMessage = execError.stderr || execError.message || String(error);
-      console.error('Rebase failed:', errorMessage);
-      return { success: false, error: errorMessage };
-    }
-  }
-
-  rebaseContinue(worktreePath: string): { success: boolean; error?: string } {
-    try {
-      this.run(['-c', 'core.editor=true', 'rebase', '--continue'], { cwd: worktreePath });
-      return { success: true };
-    } catch (error: unknown) {
-      const execError = error as ExecError;
-      const errorMessage = execError.stderr || execError.message || String(error);
-      console.error('Rebase continue failed:', errorMessage);
-      return { success: false, error: errorMessage };
-    }
-  }
-
-  rebaseAbort(worktreePath: string): boolean {
-    try {
-      this.run(['rebase', '--abort'], { cwd: worktreePath });
-      return true;
+      await this.run(['merge-tree', '--write-tree', '-z', '--name-only', '--no-messages', onto, 'HEAD'], {
+        cwd: worktreePath,
+        timeoutMs: GIT_TIMEOUTS.long,
+      });
+      return { checked: true, hasConflicts: false, conflictingFiles: [] };
     } catch (error) {
-      console.error('Rebase abort failed:', error);
-      return false;
+      // Exit 1 means conflicts. Anything else (e.g. 129 on git < 2.38) means we can't tell.
+      if (error instanceof GitError && error.exitCode === 1) {
+        // Output: <tree>\0<file>\0<file>\0...
+        const files = error.stdout.split('\0').slice(1).filter(Boolean);
+        return { checked: true, hasConflicts: true, conflictingFiles: [...new Set(files)] };
+      }
+      return { checked: false, hasConflicts: false, conflictingFiles: [] };
     }
   }
 
-  rebaseSkip(worktreePath: string): { success: boolean; error?: string } {
-    try {
-      this.run(['rebase', '--skip'], { cwd: worktreePath });
-      return { success: true };
-    } catch (error: unknown) {
-      const execError = error as ExecError;
-      const errorMessage = execError.stderr || execError.message || String(error);
-      console.error('Rebase skip failed:', errorMessage);
-      return { success: false, error: errorMessage };
-    }
+  async isUpToDate(worktreePath: string, ref: string): Promise<boolean> {
+    return this.isAncestor(worktreePath, ref, 'HEAD');
+  }
+
+  /** Environment for rebase steps: never open an editor (GIT_EDITOR beats core.editor). */
+  private static readonly NO_EDITOR = { GIT_EDITOR: 'true' };
+
+  async rebase(worktreePath: string, onto: string): Promise<GitResult> {
+    return this.attempt(['rebase', '--autostash', onto], { cwd: worktreePath, timeoutMs: GIT_TIMEOUTS.long, env: GitService.NO_EDITOR });
+  }
+
+  async rebaseContinue(worktreePath: string): Promise<GitResult> {
+    return this.attempt(['-c', 'core.editor=true', 'rebase', '--continue'], {
+      cwd: worktreePath,
+      timeoutMs: GIT_TIMEOUTS.long,
+      env: GitService.NO_EDITOR,
+    });
+  }
+
+  async rebaseAbort(worktreePath: string): Promise<GitResult> {
+    return this.attempt(['rebase', '--abort'], { cwd: worktreePath, timeoutMs: GIT_TIMEOUTS.long });
+  }
+
+  async rebaseSkip(worktreePath: string): Promise<GitResult> {
+    return this.attempt(['rebase', '--skip'], { cwd: worktreePath, timeoutMs: GIT_TIMEOUTS.long, env: GitService.NO_EDITOR });
   }
 }

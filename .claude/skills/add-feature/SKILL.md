@@ -159,10 +159,11 @@ Add to package.json with `"group": "inline"`.
 
 ## Testing Changes
 
-1. Compile: `npm run compile`
-2. Package: `npx @vscode/vsce package --allow-missing-repository`
-3. Install: `code --install-extension agntree-0.1.0.vsix`
-4. Reload VS Code window
+1. Unit tests: `npm test` (type-check plus `src/test/*.test.ts`). Add a test there for any new git or session logic; keep that logic in `src/services/` or `src/utils/`, which can't import `vscode`.
+2. Compile: `npm run compile`
+3. Package: `npx @vscode/vsce package --allow-missing-repository`
+4. Install: `code --install-extension agntree-0.1.0.vsix`
+5. Reload VS Code window
 
 ## Code Style
 

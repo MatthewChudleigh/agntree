@@ -20,12 +20,21 @@ export interface Worktree {
   id: string;
   /** Parent repository ID */
   repoId: string;
-  /** Branch name or descriptive name */
+  /** Display name: the branch, or the folder name when HEAD is detached */
   name: string;
+  /**
+   * Local branch checked out in this worktree, or null when HEAD is detached.
+   * Use this (never `name`) for anything that operates on the branch.
+   */
+  branch: string | null;
+  /** Commit SHA checked out, if known */
+  head: string | null;
   /** Absolute path to the worktree directory */
   path: string;
   /** Whether this is the main worktree */
   isMain: boolean;
+  /** Whether HEAD is detached (no branch checked out) */
+  isDetached: boolean;
 }
 
 /**
@@ -56,12 +65,23 @@ export interface ChatSession {
 export interface FileChange {
   /** Relative file path from worktree root */
   path: string;
+  /** Previous path, for renames and copies */
+  origPath?: string;
   /** Type of change */
-  status: 'added' | 'modified' | 'deleted' | 'renamed';
+  status: 'added' | 'modified' | 'deleted' | 'renamed' | 'untracked' | 'conflicted';
   /** Number of lines added */
   additions: number;
   /** Number of lines removed */
   deletions: number;
+}
+
+/**
+ * Staged and unstaged changes in a worktree, as reported by git status.
+ */
+export interface WorkingTreeStatus {
+  staged: FileChange[];
+  /** Unstaged changes, untracked files, and unresolved merge conflicts */
+  unstaged: FileChange[];
 }
 
 /**

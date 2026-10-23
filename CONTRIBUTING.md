@@ -30,7 +30,13 @@ npm run watch
 
 ### Testing Locally
 
-Press **F5** in VS Code to launch the Extension Development Host with the extension loaded.
+Run the unit tests (type-check first, then `node:test` against real temporary git repositories):
+
+```bash
+npm test
+```
+
+Then press **F5** in VS Code to launch the Extension Development Host with the extension loaded.
 
 ### Build & Package
 
@@ -59,7 +65,7 @@ code --install-extension *.vsix   # Install locally
 1. Fork the repository
 2. Create a feature branch from `main`
 3. Make your changes
-4. Run `npm run lint` and fix any issues
+4. Run `npm test` and fix any failures
 5. Test in the Extension Development Host (F5)
 6. Submit a pull request with a clear description
 

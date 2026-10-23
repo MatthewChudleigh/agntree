@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { StorageService } from '../services/StorageService';
 import { GitService } from '../services/GitService';
 import { TerminalManager } from '../services/TerminalManager';
@@ -7,6 +8,7 @@ import { SessionWatcher } from '../services/SessionWatcher';
 import { WorkspaceTreeItem, WorkspacesTreeProvider } from '../providers/WorkspacesTreeProvider';
 import { ChangesTreeProvider, ChangeTreeItem, ChangeSectionItem } from '../providers/ChangesTreeProvider';
 import { ChatSession, Worktree } from '../types';
+import { samePath } from '../utils/paths';
 
 /**
  * Register chat-related commands
@@ -21,49 +23,37 @@ export function registerChatCommands(
   sessionWatcher: SessionWatcher,
   refreshTree: () => void
 ): void {
+  /** Let the user pick a worktree from every repository. */
+  async function pickWorktree(placeHolder: string): Promise<Worktree | undefined> {
+    const repos = storageService.getRepositories();
+    const lists = await Promise.all(repos.map((repo) => gitService.listWorktrees(repo.rootPath, repo.id)));
+    const allWorktrees = repos.flatMap((repo, index) =>
+      lists[index].map((wt) => ({ label: `${repo.name} / ${wt.name}`, description: wt.path, worktree: wt }))
+    );
+
+    if (allWorktrees.length === 0) {
+      vscode.window.showErrorMessage('No worktrees available. Add a repository first.');
+      return undefined;
+    }
+
+    const selected = await vscode.window.showQuickPick(allWorktrees, { placeHolder });
+    return selected?.worktree;
+  }
+
   // New Chat
   context.subscriptions.push(
     vscode.commands.registerCommand(
       'agntree.newChat',
       async (item?: WorkspaceTreeItem) => {
-        let worktree: Worktree | undefined;
-
-        if (item && item.itemType === 'worktree') {
-          worktree = item.data as Worktree;
-        } else {
-          // Need to show picker - gather all worktrees from all repos
-          const repos = storageService.getRepositories();
-          const allWorktrees: { label: string; description: string; worktree: Worktree }[] = [];
-
-          for (const repo of repos) {
-            const worktrees = gitService.listWorktrees(repo.rootPath, repo.id);
-            for (const wt of worktrees) {
-              allWorktrees.push({
-                label: `${repo.name} / ${wt.name}`,
-                description: wt.path,
-                worktree: wt,
-              });
-            }
-          }
-
-          if (allWorktrees.length === 0) {
-            vscode.window.showErrorMessage('No worktrees available. Add a repository first.');
-            return;
-          }
-
-          const selected = await vscode.window.showQuickPick(allWorktrees, {
-            placeHolder: 'Select worktree for new session',
-          });
-
-          if (!selected) {
-            return;
-          }
-
-          worktree = selected.worktree;
+        const worktree = item && item.itemType === 'worktree'
+          ? item.data as Worktree
+          : await pickWorktree('Select worktree for new session');
+        if (!worktree) {
+          return;
         }
 
         // Get current commit for change tracking
-        const baseCommit = gitService.getCurrentCommit(worktree.path);
+        const baseCommit = await gitService.getCurrentCommit(worktree.path);
 
         // Create the chat immediately with a temporary name
         // The name will be auto-updated when a summary or first prompt is available
@@ -93,7 +83,7 @@ export function registerChatCommands(
         }
 
         const chat = item.data as ChatSession;
-        const worktree = workspacesProvider.getWorktreeById(chat.worktreeId);
+        const worktree = await workspacesProvider.getWorktreeById(chat.worktreeId);
 
         if (!worktree) {
           vscode.window.showErrorMessage('Could not find worktree for this session.');
@@ -252,14 +242,14 @@ export function registerChatCommands(
         // Check if it's a diff tab (modified files)
         if (tab.input instanceof vscode.TabInputTextDiff) {
           const diffInput = tab.input as vscode.TabInputTextDiff;
-          if (diffInput.modified.fsPath === currentDiffPath) {
+          if (samePath(diffInput.modified.fsPath, currentDiffPath)) {
             shouldClose = true;
           }
         }
         // Check if it's a regular text tab (added files)
         else if (tab.input instanceof vscode.TabInputText) {
           const textInput = tab.input as vscode.TabInputText;
-          if (textInput.uri.fsPath === currentDiffPath) {
+          if (samePath(textInput.uri.fsPath, currentDiffPath)) {
             shouldClose = true;
           }
         }
@@ -276,16 +266,15 @@ export function registerChatCommands(
     }
   }
 
-  // Helper to create git URI for different refs
+  // A git: URI for a file at a ref ('~' = the index), in the form VS Code's Git extension
+  // reads: the file URI's path, plus its fsPath and the ref in the query.
   const createGitUri = (filePath: string, ref: string): vscode.Uri => {
-    return vscode.Uri.from({
-      scheme: 'git',
-      path: filePath,
-      query: JSON.stringify({ path: filePath, ref: ref }),
-    });
+    const fileUri = vscode.Uri.file(filePath);
+    return fileUri.with({ scheme: 'git', query: JSON.stringify({ path: fileUri.fsPath, ref }) });
   };
 
-  // Open Diff
+  // Open Diff. Diffs follow the user's own diff editor settings; this command never
+  // changes settings or locks editor groups.
   context.subscriptions.push(
     vscode.commands.registerCommand(
       'agntree.openDiff',
@@ -294,13 +283,13 @@ export function registerChatCommands(
           return;
         }
 
-        const path = await import('path');
-        const fullPath = `${item.worktreePath}/${item.change.path}`;
-        const fileName = path.basename(item.change.path);
+        const { change, worktreePath } = item;
+        const fullPath = path.join(worktreePath, change.path);
+        const fileName = path.basename(change.path);
         const fileUri = vscode.Uri.file(fullPath);
 
         // Toggle: if same file is clicked, close it
-        if (currentDiffPath === fullPath) {
+        if (currentDiffPath !== null && samePath(currentDiffPath, fullPath)) {
           await closeCurrentDiff();
           currentDiffPath = null;
           return;
@@ -310,14 +299,10 @@ export function registerChatCommands(
         await closeCurrentDiff();
         currentDiffPath = fullPath;
 
-        // Force inline diff mode (up/down view instead of side-by-side)
-        const config = vscode.workspace.getConfiguration('diffEditor');
-        await config.update('renderSideBySide', false, vscode.ConfigurationTarget.Global);
-
         // Ensure the repository is opened in VS Code's Git extension
         // This allows the git: scheme to work for repos outside the workspace
         try {
-          await vscode.commands.executeCommand('git.openRepository', item.worktreePath);
+          await vscode.commands.executeCommand('git.openRepository', worktreePath);
         } catch {
           // Ignore if git extension is not available
         }
@@ -325,70 +310,40 @@ export function registerChatCommands(
         // Focus the second editor group first
         await vscode.commands.executeCommand('workbench.action.focusSecondEditorGroup');
 
-        // For added files (new/untracked), just open the file
-        if (item.change.status === 'added') {
-          await vscode.window.showTextDocument(fileUri, {
-            viewColumn: vscode.ViewColumn.Two,
-            preview: true,
-            preserveFocus: false,
-          });
-          // Lock the editor group to prevent other files from taking over
-          await vscode.commands.executeCommand('workbench.action.lockEditorGroup');
-          return;
-        }
+        const options = { viewColumn: vscode.ViewColumn.Two, preview: true };
+        const showDocument = (uri: vscode.Uri) =>
+          vscode.window.showTextDocument(uri, { ...options, preserveFocus: false });
 
         try {
-          if (item.isStaged) {
-            // Check if file exists in HEAD (for newly added staged files, it won't)
-            // execFile with an argument array — never interpolate paths into a shell string.
-            const { execFileSync } = await import('child_process');
-            let existsInHead = true;
-            try {
-              execFileSync('git', ['cat-file', '-e', `HEAD:${item.change.path}`], {
-                cwd: item.worktreePath,
-                stdio: ['pipe', 'pipe', 'pipe'],
-              });
-            } catch {
-              existsInHead = false;
-            }
-
-            if (!existsInHead) {
-              // New file staged - just show the staged content from index
-              const indexUri = createGitUri(fullPath, '~');
-              await vscode.window.showTextDocument(indexUri, {
-                viewColumn: vscode.ViewColumn.Two,
-                preview: true,
-                preserveFocus: false,
-              });
-              await vscode.commands.executeCommand('workbench.action.lockEditorGroup');
-              return;
-            } else {
-              // Staged diff: show index vs HEAD
-              // Left = HEAD (original), Right = Index (staged changes)
-              const headUri = createGitUri(fullPath, 'HEAD');
-              const indexUri = createGitUri(fullPath, '~');
-              await vscode.commands.executeCommand(
-                'vscode.diff',
-                headUri,
-                indexUri,
-                `${fileName} (Staged)`,
-                { viewColumn: vscode.ViewColumn.Two, preview: true }
-              );
-            }
-          } else {
-            // Unstaged diff: show working tree vs index/HEAD
-            // Left = Index or HEAD, Right = Working tree
-            const baseUri = createGitUri(fullPath, '~');
+          if (change.status === 'untracked' || (!item.isStaged && change.status === 'added')) {
+            // New file: nothing to compare against, just open it
+            await showDocument(fileUri);
+          } else if (item.isStaged && change.status === 'added') {
+            // New file staged: show the staged content from the index
+            await showDocument(createGitUri(fullPath, '~'));
+          } else if (change.status === 'deleted') {
+            // Deleted: show the version being deleted (HEAD for staged, index for unstaged)
+            await showDocument(createGitUri(fullPath, item.isStaged ? 'HEAD' : '~'));
+          } else if (item.isStaged) {
+            // Staged diff: HEAD (left, at the old path for renames) vs index (right)
+            const headPath = change.origPath ? path.join(worktreePath, change.origPath) : fullPath;
             await vscode.commands.executeCommand(
               'vscode.diff',
-              baseUri,
+              createGitUri(headPath, 'HEAD'),
+              createGitUri(fullPath, '~'),
+              `${fileName} (Staged)`,
+              options
+            );
+          } else {
+            // Unstaged diff: index (left) vs working tree (right)
+            await vscode.commands.executeCommand(
+              'vscode.diff',
+              createGitUri(fullPath, '~'),
               fileUri,
-              `${fileName}`,
-              { viewColumn: vscode.ViewColumn.Two, preview: true }
+              fileName,
+              options
             );
           }
-          // Lock the editor group to prevent other files from taking over
-          await vscode.commands.executeCommand('workbench.action.lockEditorGroup');
         } catch {
           // Fallback: use git.openChange or just open the file
           try {
@@ -421,7 +376,7 @@ export function registerChatCommands(
           return;
         }
 
-        const worktree = workspacesProvider.getWorktreeById(chat.worktreeId);
+        const worktree = await workspacesProvider.getWorktreeById(chat.worktreeId);
         if (!worktree) {
           vscode.window.showErrorMessage('Could not find worktree for this session.');
           return;
@@ -430,7 +385,7 @@ export function registerChatCommands(
         // Create new chat with unique fork name (short hash suffix)
         const shortHash = Math.random().toString(36).substring(2, 6);
         const forkName = `Fork of ${chat.name} (${shortHash})`;
-        const baseCommit = gitService.getCurrentCommit(worktree.path);
+        const baseCommit = await gitService.getCurrentCommit(worktree.path);
         const forkedChat = storageService.createChat(worktree.id, forkName, baseCommit);
 
         // Register for session detection BEFORE opening terminal
@@ -466,7 +421,7 @@ export function registerChatCommands(
           return;
         }
 
-        const worktree = workspacesProvider.getWorktreeById(chat.worktreeId);
+        const worktree = await workspacesProvider.getWorktreeById(chat.worktreeId);
         if (!worktree) {
           vscode.window.showErrorMessage('Could not find worktree for this session.');
           return;
@@ -479,7 +434,7 @@ export function registerChatCommands(
         }
 
         // Get new branch name from user
-        const existingBranches = gitService.getBranches(repo.rootPath);
+        const existingBranches = await gitService.getBranches(repo.rootPath);
         const suggestedBranchName = `${worktree.name}-fork`;
 
         const newBranchName = await vscode.window.showInputBox({
@@ -504,7 +459,6 @@ export function registerChatCommands(
         }
 
         // Determine worktree path
-        const path = await import('path');
         const parentDir = path.dirname(repo.rootPath);
         const defaultWorktreePath = path.join(parentDir, `${repo.name}-${newBranchName.replace(/\//g, '-')}`);
 
@@ -524,34 +478,37 @@ export function registerChatCommands(
         }
 
         // Create the new worktree from current HEAD
-        const currentCommit = gitService.getCurrentCommit(worktree.path);
-        const success = gitService.createWorktreeWithNewBranch(
-          repo.rootPath,
-          newBranchName,
-          worktreePath,
-          currentCommit || 'HEAD'
+        const currentCommit = await gitService.getCurrentCommit(worktree.path);
+        const created = await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: `Creating worktree ${newBranchName}...` },
+          async () => {
+            const result = await gitService.createWorktreeWithNewBranch(
+              repo.rootPath,
+              newBranchName,
+              worktreePath,
+              currentCommit || 'HEAD'
+            );
+            // Copy uncommitted changes to the new worktree
+            if (result.ok && (await gitService.hasUncommittedChanges(worktree.path))) {
+              if (!(await gitService.copyUncommittedChanges(worktree.path, worktreePath))) {
+                vscode.window.showWarningMessage('Worktree created but some changes may not have been copied.');
+              }
+            }
+            return result;
+          }
         );
 
-        if (!success) {
-          vscode.window.showErrorMessage('Failed to create worktree.');
+        if (!created.ok) {
+          vscode.window.showErrorMessage(`Failed to create worktree: ${created.error}`);
           return;
-        }
-
-        // Copy uncommitted changes to the new worktree
-        const hasChanges = gitService.hasUncommittedChanges(worktree.path);
-        if (hasChanges) {
-          const copied = gitService.copyUncommittedChanges(worktree.path, worktreePath);
-          if (!copied) {
-            vscode.window.showWarningMessage('Worktree created but some changes may not have been copied.');
-          }
         }
 
         // Refresh to get the new worktree
         refreshTree();
 
-        // Find the new worktree
-        const newWorktrees = gitService.listWorktrees(repo.rootPath, repo.id);
-        const newWorktree = newWorktrees.find(w => w.path === worktreePath);
+        // Find the new worktree (git prints paths its own way, e.g. forward slashes on Windows)
+        const newWorktrees = await gitService.listWorktrees(repo.rootPath, repo.id);
+        const newWorktree = newWorktrees.find(w => samePath(w.path, worktreePath));
 
         if (!newWorktree) {
           vscode.window.showErrorMessage('Worktree created but could not find it in the list.');
@@ -598,40 +555,11 @@ export function registerChatCommands(
     vscode.commands.registerCommand(
       'agntree.importSessions',
       async (item?: WorkspaceTreeItem) => {
-        let worktree: Worktree | undefined;
-
-        if (item && item.itemType === 'worktree') {
-          worktree = item.data as Worktree;
-        } else {
-          // Show picker for worktree
-          const repos = storageService.getRepositories();
-          const allWorktrees: { label: string; description: string; worktree: Worktree }[] = [];
-
-          for (const repo of repos) {
-            const worktrees = gitService.listWorktrees(repo.rootPath, repo.id);
-            for (const wt of worktrees) {
-              allWorktrees.push({
-                label: `${repo.name} / ${wt.name}`,
-                description: wt.path,
-                worktree: wt,
-              });
-            }
-          }
-
-          if (allWorktrees.length === 0) {
-            vscode.window.showErrorMessage('No worktrees available. Add a repository first.');
-            return;
-          }
-
-          const selected = await vscode.window.showQuickPick(allWorktrees, {
-            placeHolder: 'Select worktree to import sessions for',
-          });
-
-          if (!selected) {
-            return;
-          }
-
-          worktree = selected.worktree;
+        const worktree = item && item.itemType === 'worktree'
+          ? item.data as Worktree
+          : await pickWorktree('Select worktree to import sessions for');
+        if (!worktree) {
+          return;
         }
 
         // Find existing Claude sessions for this worktree
@@ -729,7 +657,7 @@ export function registerChatCommands(
         }
 
         // Gather all worktrees for this repository
-        const worktrees = gitService.listWorktrees(repo.rootPath, repo.id);
+        const worktrees = await gitService.listWorktrees(repo.rootPath, repo.id);
         const worktreePaths = worktrees.map(wt => wt.path);
 
         // Find all sessions with progress indicator
@@ -757,7 +685,6 @@ export function registerChatCommands(
         }
 
         // Match each session to a worktree by comparing cwd
-        const path = await import('path');
         const matchSessionToWorktree = (session: { cwd: string }): Worktree => {
           const sessionCwd = path.resolve(session.cwd);
           // Find the worktree whose path best matches (longest match wins)
@@ -916,11 +843,11 @@ export function registerChatCommands(
           return;
         }
 
-        const success = gitService.stageFile(item.worktreePath, item.change.path);
-        if (success) {
+        const result = await gitService.stageFiles(item.worktreePath, [item.change.path]);
+        if (result.ok) {
           changesProvider.refresh();
         } else {
-          vscode.window.showErrorMessage(`Failed to stage ${item.change.path}`);
+          vscode.window.showErrorMessage(`Failed to stage ${item.change.path}: ${result.error}`);
         }
       }
     )
@@ -935,11 +862,13 @@ export function registerChatCommands(
           return;
         }
 
-        const success = gitService.unstageFile(item.worktreePath, item.change.path);
-        if (success) {
+        // A staged rename is two index entries: unstage the new path and the old one.
+        const paths = item.change.origPath ? [item.change.path, item.change.origPath] : [item.change.path];
+        const result = await gitService.unstageFiles(item.worktreePath, paths);
+        if (result.ok) {
           changesProvider.refresh();
         } else {
-          vscode.window.showErrorMessage(`Failed to unstage ${item.change.path}`);
+          vscode.window.showErrorMessage(`Failed to unstage ${item.change.path}: ${result.error}`);
         }
       }
     )
@@ -956,7 +885,9 @@ export function registerChatCommands(
 
         // Confirm before discarding
         const confirm = await vscode.window.showWarningMessage(
-          `Discard changes to "${item.change.path}"? This cannot be undone.`,
+          item.change.status === 'untracked'
+            ? `Delete untracked file "${item.change.path}"? This cannot be undone.`
+            : `Discard changes to "${item.change.path}"? This cannot be undone.`,
           { modal: true },
           'Discard'
         );
@@ -965,11 +896,11 @@ export function registerChatCommands(
           return;
         }
 
-        const success = gitService.discardFile(item.worktreePath, item.change.path);
-        if (success) {
+        const result = await gitService.discardChange(item.worktreePath, item.change);
+        if (result.ok) {
           changesProvider.refresh();
         } else {
-          vscode.window.showErrorMessage(`Failed to discard changes to ${item.change.path}`);
+          vscode.window.showErrorMessage(`Failed to discard changes to ${item.change.path}: ${result.error}`);
         }
       }
     )
@@ -986,7 +917,7 @@ export function registerChatCommands(
         }
 
         const confirm = await vscode.window.showWarningMessage(
-          'Discard all unstaged changes? This cannot be undone.',
+          'Discard all unstaged changes and permanently delete all untracked files? Staged changes are kept. This cannot be undone.',
           { modal: true },
           'Discard All'
         );
@@ -995,11 +926,11 @@ export function registerChatCommands(
           return;
         }
 
-        const success = gitService.discardAll(worktree.path);
-        if (success) {
+        const result = await gitService.discardAll(worktree.path);
+        if (result.ok) {
           changesProvider.refresh();
         } else {
-          vscode.window.showErrorMessage('Failed to discard all changes');
+          vscode.window.showErrorMessage(`Failed to discard all changes: ${result.error}`);
         }
       }
     )
@@ -1015,11 +946,11 @@ export function registerChatCommands(
           return;
         }
 
-        const success = gitService.stageAll(worktree.path);
-        if (success) {
+        const result = await gitService.stageAll(worktree.path);
+        if (result.ok) {
           changesProvider.refresh();
         } else {
-          vscode.window.showErrorMessage('Failed to stage all changes');
+          vscode.window.showErrorMessage(`Failed to stage all changes: ${result.error}`);
         }
       }
     )
@@ -1035,11 +966,11 @@ export function registerChatCommands(
           return;
         }
 
-        const success = gitService.unstageAll(worktree.path);
-        if (success) {
+        const result = await gitService.unstageAll(worktree.path);
+        if (result.ok) {
           changesProvider.refresh();
         } else {
-          vscode.window.showErrorMessage('Failed to unstage all changes');
+          vscode.window.showErrorMessage(`Failed to unstage all changes: ${result.error}`);
         }
       }
     )
@@ -1056,14 +987,14 @@ export function registerChatCommands(
           return;
         }
 
-        if (!gitService.isRebaseInProgress(worktree.path)) {
+        if (!(await gitService.isRebaseInProgress(worktree.path))) {
           vscode.window.showInformationMessage('No rebase in progress.');
           return;
         }
 
-        const result = gitService.rebaseContinue(worktree.path);
-        if (result.success) {
-          if (gitService.isRebaseInProgress(worktree.path)) {
+        const result = await gitService.rebaseContinue(worktree.path);
+        if (result.ok) {
+          if (await gitService.isRebaseInProgress(worktree.path)) {
             vscode.window.showWarningMessage(
               'Rebase continued but more conflicts were encountered. Resolve and continue.'
             );
@@ -1072,9 +1003,7 @@ export function registerChatCommands(
             refreshTree();
           }
         } else {
-          vscode.window.showErrorMessage(
-            `Failed to continue rebase: ${result.error || 'Unknown error'}`
-          );
+          vscode.window.showErrorMessage(`Failed to continue rebase: ${result.error}`);
         }
         changesProvider.refresh();
       }
@@ -1092,7 +1021,7 @@ export function registerChatCommands(
           return;
         }
 
-        if (!gitService.isRebaseInProgress(worktree.path)) {
+        if (!(await gitService.isRebaseInProgress(worktree.path))) {
           vscode.window.showInformationMessage('No rebase in progress.');
           return;
         }
@@ -1107,12 +1036,12 @@ export function registerChatCommands(
           return;
         }
 
-        const success = gitService.rebaseAbort(worktree.path);
-        if (success) {
+        const result = await gitService.rebaseAbort(worktree.path);
+        if (result.ok) {
           vscode.window.showInformationMessage('Rebase aborted.');
           refreshTree();
         } else {
-          vscode.window.showErrorMessage('Failed to abort rebase.');
+          vscode.window.showErrorMessage(`Failed to abort rebase: ${result.error}`);
         }
         changesProvider.refresh();
       }
@@ -1130,14 +1059,14 @@ export function registerChatCommands(
           return;
         }
 
-        if (!gitService.isRebaseInProgress(worktree.path)) {
+        if (!(await gitService.isRebaseInProgress(worktree.path))) {
           vscode.window.showInformationMessage('No rebase in progress.');
           return;
         }
 
-        const result = gitService.rebaseSkip(worktree.path);
-        if (result.success) {
-          if (gitService.isRebaseInProgress(worktree.path)) {
+        const result = await gitService.rebaseSkip(worktree.path);
+        if (result.ok) {
+          if (await gitService.isRebaseInProgress(worktree.path)) {
             vscode.window.showWarningMessage(
               'Commit skipped but rebase is still in progress.'
             );
@@ -1146,9 +1075,7 @@ export function registerChatCommands(
             refreshTree();
           }
         } else {
-          vscode.window.showErrorMessage(
-            `Failed to skip: ${result.error || 'Unknown error'}`
-          );
+          vscode.window.showErrorMessage(`Failed to skip: ${result.error}`);
         }
         changesProvider.refresh();
       }
@@ -1188,12 +1115,12 @@ export function registerChatCommands(
 
         // Build worktree lookup: worktreeId → { worktree, repo }
         const worktreeLookup = new Map<string, { worktree: Worktree; repoName: string }>();
-        for (const repo of repos) {
-          const worktrees = gitService.listWorktrees(repo.rootPath, repo.id);
-          for (const wt of worktrees) {
+        const worktreeLists = await Promise.all(repos.map((repo) => gitService.listWorktrees(repo.rootPath, repo.id)));
+        repos.forEach((repo, index) => {
+          for (const wt of worktreeLists[index]) {
             worktreeLookup.set(wt.id, { worktree: wt, repoName: repo.name });
           }
-        }
+        });
 
         // Group starred chats by repo
         const groupedByRepo = new Map<string, { repoName: string; chats: { chat: ChatSession; worktreeName: string }[] }>();

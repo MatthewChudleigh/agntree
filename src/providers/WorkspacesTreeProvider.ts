@@ -6,6 +6,7 @@ import { GitService } from '../services/GitService';
 import { GitHubService } from '../services/GitHubService';
 import { TerminalManager } from '../services/TerminalManager';
 import { ClaudeSessionService } from '../services/ClaudeSessionService';
+import { samePath } from '../utils/paths';
 
 /**
  * Tree item representing a node in the workspaces tree
@@ -121,11 +122,12 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
       mainWatcher.onDidCreate(debouncedRefresh);
       this.headWatchers.push(mainWatcher);
 
-      // Watch other worktrees HEAD: .git/worktrees/*/HEAD
+      // Watch other worktrees HEAD: .git/worktrees/*/HEAD (created/removed with the worktree)
       const worktreesPattern = new vscode.RelativePattern(gitDir, 'worktrees/*/HEAD');
       const worktreesWatcher = vscode.workspace.createFileSystemWatcher(worktreesPattern);
       worktreesWatcher.onDidChange(debouncedRefresh);
       worktreesWatcher.onDidCreate(debouncedRefresh);
+      worktreesWatcher.onDidDelete(debouncedRefresh);
       this.headWatchers.push(worktreesWatcher);
     }
   }
@@ -213,11 +215,11 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
   /**
    * Get parent of a tree item (required for reveal() to work)
    */
-  getParent(element: WorkspaceTreeItem): WorkspaceTreeItem | undefined {
+  async getParent(element: WorkspaceTreeItem): Promise<WorkspaceTreeItem | undefined> {
     switch (element.itemType) {
       case 'chat': {
         const chat = element.data as ChatSession;
-        const worktree = this.getWorktreeById(chat.worktreeId);
+        const worktree = await this.getWorktreeById(chat.worktreeId);
         return worktree ? this.getWorktreeTreeItem(worktree) : undefined;
       }
       case 'worktree': {
@@ -256,12 +258,16 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
   /**
    * Get repository tree items
    */
-  private getRepositoryItems(): WorkspaceTreeItem[] {
+  private async getRepositoryItems(): Promise<WorkspaceTreeItem[]> {
     const repositories = this.storageService.getRepositories();
 
-    return repositories.map((repo) => {
-      const worktrees = this.gitService.listWorktrees(repo.rootPath, repo.id);
-      this.worktreeCache.set(repo.id, worktrees);
+    // List every repo's worktrees in parallel; commands look worktrees up in this cache.
+    const worktreeLists = await Promise.all(
+      repositories.map((repo) => this.gitService.listWorktrees(repo.rootPath, repo.id))
+    );
+
+    return repositories.map((repo, index) => {
+      this.worktreeCache.set(repo.id, worktreeLists[index]);
 
       const item = new WorkspaceTreeItem(
         repo.name,
@@ -283,14 +289,14 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
   }
 
   /**
-   * Get worktree tree items for a repository (sync, uses cached PR info)
+   * Get worktree tree items for a repository (PR badges come from the cache; misses are fetched in the background)
    */
-  private getWorktreeItems(repo: Repository): WorkspaceTreeItem[] {
+  private async getWorktreeItems(repo: Repository): Promise<WorkspaceTreeItem[]> {
     // Check cache first
     let worktrees = this.worktreeCache.get(repo.id);
 
     if (!worktrees) {
-      worktrees = this.gitService.listWorktrees(repo.rootPath, repo.id);
+      worktrees = await this.gitService.listWorktrees(repo.rootPath, repo.id);
       this.worktreeCache.set(repo.id, worktrees);
     }
 
@@ -301,8 +307,7 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
     const uncachedBranches: string[] = [];
 
     const items = worktrees.map((worktree) => {
-      const hasChats = this.storageService.getChatsByWorktree(worktree.id).length > 0;
-      const isCurrentWorkspace = currentFolder === worktree.path;
+      const isCurrentWorkspace = !!currentFolder && samePath(currentFolder, worktree.path);
 
       const item = new WorkspaceTreeItem(
         worktree.name,
@@ -349,13 +354,14 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
         descParts.push(`PR #${prWorktreeNumber}`);
       }
 
-      // Get cached PR info (sync - may be undefined if not fetched yet)
-      const prInfo = this.gitHubService.getCachedPRInfo(repo.rootPath, worktree.name);
+      // Get cached PR info (may be undefined if not fetched yet). Detached worktrees
+      // have no branch, so there's nothing to look a PR up by.
+      const prInfo = worktree.branch ? this.gitHubService.getCachedPRInfo(repo.rootPath, worktree.branch) : null;
 
-      if (prInfo === undefined) {
+      if (prInfo === undefined && worktree.branch) {
         // Not cached yet, queue for background fetch
-        uncachedBranches.push(worktree.name);
-      } else if (prInfo !== null) {
+        uncachedBranches.push(worktree.branch);
+      } else if (prInfo) {
         // Only add PR description if not already shown via PR worktree marker
         if (!prWorktreeNumber) {
           const prDesc = this.gitHubService.formatPRDescription(prInfo);
@@ -525,37 +531,38 @@ export class WorkspacesTreeProvider implements vscode.TreeDataProvider<Workspace
   }
 
   /**
-   * Get worktree by ID (for use by commands)
+   * Get a worktree from the cache filled by the last tree render, without running git.
    */
-  getWorktreeById(worktreeId: string): Worktree | undefined {
+  getCachedWorktreeById(worktreeId: string): Worktree | undefined {
     for (const worktrees of this.worktreeCache.values()) {
       const found = worktrees.find((w) => w.id === worktreeId);
       if (found) return found;
     }
-
-    // If not in cache, search all repos
-    const repos = this.storageService.getRepositories();
-    for (const repo of repos) {
-      const worktrees = this.gitService.listWorktrees(repo.rootPath, repo.id);
-      const found = worktrees.find((w) => w.id === worktreeId);
-      if (found) return found;
-    }
-
     return undefined;
   }
 
-  findWorktreeByPath(targetPath: string): Worktree | undefined {
+  /**
+   * Get worktree by ID (for use by commands). Falls back to listing worktrees.
+   */
+  async getWorktreeById(worktreeId: string): Promise<Worktree | undefined> {
+    return this.getCachedWorktreeById(worktreeId) ?? this.findWorktree((w) => w.id === worktreeId);
+  }
+
+  async findWorktreeByPath(targetPath: string): Promise<Worktree | undefined> {
+    const matches = (w: Worktree) => samePath(w.path, targetPath);
     for (const worktrees of this.worktreeCache.values()) {
-      const found = worktrees.find((w) => w.path === targetPath);
+      const found = worktrees.find(matches);
       if (found) return found;
     }
+    return this.findWorktree(matches);
+  }
+
+  /** List every repository's worktrees (refreshing the cache) and return the first match. */
+  private async findWorktree(predicate: (worktree: Worktree) => boolean): Promise<Worktree | undefined> {
     const repos = this.storageService.getRepositories();
-    for (const repo of repos) {
-      const worktrees = this.gitService.listWorktrees(repo.rootPath, repo.id);
-      const found = worktrees.find((w) => w.path === targetPath);
-      if (found) return found;
-    }
-    return undefined;
+    const lists = await Promise.all(repos.map((repo) => this.gitService.listWorktrees(repo.rootPath, repo.id)));
+    repos.forEach((repo, index) => this.worktreeCache.set(repo.id, lists[index]));
+    return lists.flat().find(predicate);
   }
 
   /**
